@@ -106,9 +106,9 @@ crypto (`1a7fd3b`; per-packet `recvfrom`/`sendto` on ARMv8.0 CPUs since `--sysca
 `--unit-test`, e2e coverage for `easy-faketcp` and for `--lower-level auto` over a veth
 pair in a network namespace (also C++ interop across it).
 
-* `--syscalls auto` decides from the LSE-atomics hwcap (ARMv8.0 → per-packet syscalls). A
-  kernel built without `CONFIG_ARM64_SW_TTBR0_PAN` on such a CPU would do marginally better
-  with `mmsg` (untested; the Docker numbers say the difference is a few percent at most).
+* `--syscalls auto` = LSE-atomics hwcap (ARMv8.1+ → `mmsg`), otherwise the running kernel's
+  config (`/boot/config-<release>`: software PAN off → `mmsg`, on or unreadable → `single`);
+  the reason is logged at startup. `/proc/config.gz` is not read (would need zlib).
 * **Measure again**: the deployment shape (Pi client ↔ VPS server over eth0) and the Pi 5
   (hardware PAN and AES: expect `mmsg` + `hw`). `bench.sh quick` in Docker is the ~1 min
   regression check; `tools/bench/run_quick_pi.sh` the ~30 s-per-case Pi check (`FIXED=<pps>`

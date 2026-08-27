@@ -15,11 +15,11 @@ pub use crate::types::{Syscalls, cpu_has_lse};
 static SINGLE_SYSCALLS: AtomicBool = AtomicBool::new(false);
 
 /// Select the syscall flavour for the whole process (call once at startup); returns the
-/// resolved choice.
-pub fn set_syscalls(mode: Syscalls) -> Syscalls {
-    let r = mode.resolve();
+/// resolved choice and the reason.
+pub fn set_syscalls(mode: Syscalls) -> (Syscalls, &'static str) {
+    let (r, why) = mode.resolve();
     SINGLE_SYSCALLS.store(r == Syscalls::Single, Ordering::Relaxed);
-    r
+    (r, why)
 }
 
 fn single_syscalls() -> bool {
