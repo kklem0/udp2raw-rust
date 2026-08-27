@@ -1,0 +1,191 @@
+# 2026-08-28 00:19-00:44 +08:00 test-site-1 (Raspberry Pi 4, Cortex-A72 x4 @1.8GHz, Ubuntu 24.04, kernel 6.8.0-1047-raspi, CONFIG_PREEMPT=y, ARMv8.0: no hardware PAN)
+# Why the batched-I/O build (HEAD 3c380ad, recvmmsg/sendmmsg) costs more kernel time per packet than 60a36d6 (recvfrom/sendto), and the --syscalls fix.
+# Tool: tools/bench/sysprof_pi.sh — fixed offered rate over loopback, both daemons on the box, --threads 0, 64-packet bursts, 1300-byte datagrams:
+#   *_cpu:   user/sys CPU per daemon (/proc/PID/stat) and context switches (voluntary+involuntary) over the middle 3 s of a 5 s blast at 10k pps
+#   *_trace: count and wall time inside each syscall type per daemon, from the tracefs raw_syscalls tracepoints (3 s at 5k pps; no ptrace overhead)
+#   *_stat:  perf stat PMU counters per daemon (cycles, instructions, L1d misses, L2 refills) divided by packets
+#   *_perf:  perf record (cpu-clock, 1999 Hz, both daemons); flat symbol reports at the end of this file
+# Binaries: old = /opt/udp2raw-rust-60a36d6-arm64 (md5 47180f1a); head = udp2raw-head = 3c380ad (1f8e7f40); fix = udp2raw-fix = 3c380ad + --syscalls (f786a8c4)
+# perf = linux-tools-raspi 6.8.0-1062 (installed for this; the running kernel stayed 1047). The router kept serving throughout.
+
+## 1. unpinned: cpu split, then per-syscall kernel time (tracepoints)
+# 2026-08-28T00:19:02+08:00 host=test-site-1 kernel=6.8.0-1047-raspi rate=10000 secs=5 trace_rate=5000 trace_secs=3 burst=64 threads=0 common='--log-level 4 --fix-gro' tracefs=/sys/kernel/tracing
+## old = /opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+old_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=29% sys=36% ctx=487v+1008nv | client user=27% sys=40% ctx=459v+474nv | 3.0s
+old_trace | trace rate=5000 sent=24960 recv=24960 | server user=14% sys=21% ctx=262v+241nv | client user=14% sys=21% ctx=250v+140nv | 3.0s
+server recvfrom calls=15889 us/call=9.3 in-syscall=4.9%
+server sendto calls=15532 us/call=26.6 in-syscall=13.7%
+server epoll_pwait calls=510 us/call=3973.2 in-syscall=67.2%
+client recvfrom calls=15810 us/call=9.3 in-syscall=4.9%
+client sendto calls=15556 us/call=28.8 in-syscall=14.9%
+client epoll_pwait calls=494 us/call=4112.6 in-syscall=67.4%
+  (trace: 127598 lines, 0 lost-event markers; in-syscall = wall time inside the syscall incl. preemption; epoll = sleeping)
+## head = ./udp2raw-head (1f8e7f40)
+head_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=28% sys=47% ctx=740v+3037nv | client user=24% sys=53% ctx=427v+706nv | 3.0s
+head_trace | trace rate=5000 sent=24960 recv=24960 | server user=14% sys=25% ctx=514v+427nv | client user=12% sys=27% ctx=248v+211nv | 3.0s
+server sendto calls=15589 us/call=27.7 in-syscall=14.3%
+server recvmmsg calls=1460 us/call=193.1 in-syscall=9.4%
+server epoll_pwait calls=1275 us/call=1516.8 in-syscall=64.1%
+server sendmmsg calls=4 us/call=54.3 in-syscall=0.0%
+client recvmmsg calls=751 us/call=382.2 in-syscall=9.5%
+client epoll_pwait calls=527 us/call=3648.9 in-syscall=63.8%
+client sendmmsg calls=518 us/call=1039.7 in-syscall=17.9%
+  (trace: 40264 lines, 0 lost-event markers; in-syscall = wall time inside the syscall incl. preemption; epoll = sleeping)
+./sysprof_pi.sh: line 23: echo: write error: Invalid argument
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand trace_buffer_kb=8195 tracing_on=0
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+
+## 2. pinned: server cpu 1, client cpu 2, generator+sink cpu 3 (rules out preemption/wakeups)
+# 2026-08-28T00:22:39+08:00 host=test-site-1 kernel=6.8.0-1047-raspi rate=10000 secs=5 trace_rate=5000 trace_secs=3 burst=64 threads=0 common='--log-level 4 --fix-gro' tracefs=/sys/kernel/tracing pin=1/2/3
+## old = /opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+old_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=28% sys=35% ctx=480v+223nv | client user=26% sys=37% ctx=482v+154nv | 3.0s
+## head = ./udp2raw-head (1f8e7f40)
+head_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=27% sys=45% ctx=803v+271nv | client user=23% sys=51% ctx=491v+172nv | 3.0s
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand trace_buffer_kb=7 tracing_on=0
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+
+## 3. unpinned again (perf not installed yet)
+# 2026-08-28T00:25:03+08:00 host=test-site-1 kernel=6.8.0-1047-raspi rate=10000 secs=5 trace_rate=5000 trace_secs=3 burst=64 threads=0 common='--log-level 4 --fix-gro' tracefs=/sys/kernel/tracing pin=//
+## old = /opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+old_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=29% sys=38% ctx=480v+1252nv | client user=26% sys=39% ctx=460v+559nv | 3.0s
+## head = ./udp2raw-head (1f8e7f40)
+head_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=28% sys=48% ctx=736v+2488nv | client user=23% sys=54% ctx=375v+842nv | 3.0s
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand trace_buffer_kb=7 tracing_on=0
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+
+## 4. PMU counters and perf sampling, old vs head
+# 2026-08-28T00:31:43+08:00 host=test-site-1 kernel=6.8.0-1047-raspi rate=10000 secs=5 trace_rate=5000 trace_secs=3 burst=64 threads=0 common='--log-level 4 --fix-gro' tracefs=/sys/kernel/tracing pin=//
+## old = /opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+old_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=30% sys=36% ctx=450v+1227nv | client user=26% sys=40% ctx=471v+390nv | 3.0s
+old_stat | stat rate=10000 sent=49984 recv=49984 | server user=31% sys=37% ctx=456v+1348nv | client user=26% sys=42% ctx=444v+1333nv | 3.0s
+  server per packet: cycles=87017 instr=96776 IPC=1.11 L1d-miss=386 L2-refill=84 cache-miss=386 ctxsw=0.05
+  client per packet: cycles=86915 instr=101273 IPC=1.17 L1d-miss=385 L2-refill=78 cache-miss=385 ctxsw=0.05
+  (per packet = counter / packets received by the sink during the whole blast; the counters cover the middle 3 s, so scale by ~5/3)
+old_perf | perf rate=10000 sent=49984 recv=49984 | server user=29% sys=39% ctx=440v+1787nv | client user=25% sys=42% ctx=447v+1116nv | 3.0s
+  perf: 17 symbols >= 0.8% in /root/bench/logs-sysprof/old_perf.perf.report (sample_period, sample_freq } = 1999, sample_type = IP|TID|TIME|CALLCHAIN|PERIOD|REGS_USER, read_format = ID|LOST, disabled = 1, inherit = 1, mmap = 1, comm = 1, freq = 1, task = 1, sample_id_all = 1, exclude_guest = 1, mmap2 = 1, comm_exec = 1, ksymbol = 1, bpf_event = 1, sample_regs_user = 0x40000000)
+## head = ./udp2raw-head (1f8e7f40)
+head_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=26% sys=48% ctx=897v+969nv | client user=22% sys=53% ctx=464v+503nv | 3.0s
+head_stat | stat rate=10000 sent=49984 recv=49984 | server user=25% sys=48% ctx=665v+364nv | client user=24% sys=52% ctx=466v+361nv | 3.0s
+  server per packet: cycles=92763 instr=105395 IPC=1.14 L1d-miss=365 L2-refill=100 cache-miss=365 ctxsw=0.03
+  client per packet: cycles=96380 instr=115209 IPC=1.20 L1d-miss=281 L2-refill=134 cache-miss=281 ctxsw=0.02
+  (per packet = counter / packets received by the sink during the whole blast; the counters cover the middle 3 s, so scale by ~5/3)
+head_perf | perf rate=10000 sent=49984 recv=49984 | server user=28% sys=50% ctx=438v+1411nv | client user=24% sys=56% ctx=381v+1081nv | 3.0s
+  perf: 15 symbols >= 0.8% in /root/bench/logs-sysprof/head_perf.perf.report (sample_period, sample_freq } = 1999, sample_type = IP|TID|TIME|CALLCHAIN|PERIOD|REGS_USER, read_format = ID|LOST, disabled = 1, inherit = 1, mmap = 1, comm = 1, freq = 1, task = 1, sample_id_all = 1, exclude_guest = 1, mmap2 = 1, comm_exec = 1, ksymbol = 1, bpf_event = 1, sample_regs_user = 0x40000000)
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand trace_buffer_kb=7 tracing_on=0
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+
+## 5. the fix: --syscalls auto (resolves to single on this CPU) with counters + perf, then --syscalls mmsg forced as control
+# 2026-08-28T00:38:46+08:00 host=test-site-1 kernel=6.8.0-1047-raspi rate=10000 secs=5 trace_rate=5000 trace_secs=3 burst=64 threads=0 common='--log-level 4 --fix-gro' tracefs=/sys/kernel/tracing pin=//
+## fix_auto = ./udp2raw-fix (f786a8c4)
+fix_auto_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=27% sys=39% ctx=1513v+524nv | client user=23% sys=40% ctx=468v+479nv | 3.0s
+fix_auto_stat | stat rate=10000 sent=49984 recv=49984 | server user=27% sys=39% ctx=1365v+507nv | client user=23% sys=41% ctx=485v+203nv | 3.0s
+  server per packet: cycles=83845 instr=96772 IPC=1.15 L1d-miss=367 L2-refill=76 cache-miss=367 ctxsw=0.04
+  client per packet: cycles=81460 instr=98458 IPC=1.21 L1d-miss=285 L2-refill=98 cache-miss=285 ctxsw=0.02
+  (per packet = counter / packets received by the sink during the whole blast; the counters cover the middle 3 s, so scale by ~5/3)
+fix_auto_perf | perf rate=10000 sent=49984 recv=49984 | server user=29% sys=40% ctx=1191v+1028nv | client user=26% sys=41% ctx=469v+894nv | 3.0s
+  perf: 19 symbols >= 0.8% in /root/bench/logs-sysprof/fix_auto_perf.perf.report (sample_period, sample_freq } = 1999, sample_type = IP|TID|TIME|CALLCHAIN|PERIOD|REGS_USER, read_format = ID|LOST, disabled = 1, inherit = 1, mmap = 1, comm = 1, freq = 1, task = 1, sample_id_all = 1, exclude_guest = 1, mmap2 = 1, comm_exec = 1, ksymbol = 1, bpf_event = 1, sample_regs_user = 0x40000000)
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand trace_buffer_kb=7 tracing_on=0
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+# 2026-08-28T00:39:19+08:00 host=test-site-1 kernel=6.8.0-1047-raspi rate=10000 secs=5 trace_rate=5000 trace_secs=3 burst=64 threads=0 common='--log-level 4 --fix-gro --syscalls mmsg' tracefs=/sys/kernel/tracing pin=//
+## fix_mmsg = ./udp2raw-fix (f786a8c4)
+fix_mmsg_cpu | cpu rate=10000 sent=49984 recv=49984 | server user=28% sys=48% ctx=875v+1392nv | client user=23% sys=53% ctx=440v+494nv | 3.0s
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand trace_buffer_kb=7 tracing_on=0
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+
+## perf flat reports (self time, symbols >= 1%, both daemons) — the only difference is uaccess_ttbr0_enable/disable (software PAN)
+## perf report, old (self time, symbols >= 1%, both daemons)
+     4.94%  [k] __local_bh_enable_ip
+     4.49%  [k] _raw_spin_unlock_irqrestore
+     3.74%  [k] uaccess_ttbr0_disable.isra.0
+     3.62%  [k] uaccess_ttbr0_enable.isra.0
+     3.19%  [k] el0_svc
+     2.72%  [k] uaccess_ttbr0_enable.isra.0
+     2.21%  [k] uaccess_ttbr0_disable.isra.0
+     1.95%  [k] nft_do_chain
+     1.95%  [.] 0x0000000000084c24
+     1.52%  [k] _raw_spin_unlock_irq
+     1.42%  [k] net_rx_action
+     1.24%  [k] handle_softirqs
+     1.02%  [.] recvfrom
+## perf report, head (self time, symbols >= 1%, both daemons)
+     8.21%  [k] uaccess_ttbr0_enable.isra.0
+     7.94%  [k] uaccess_ttbr0_disable.isra.0
+     4.79%  [k] uaccess_ttbr0_disable.isra.0
+     4.72%  [k] uaccess_ttbr0_enable.isra.0
+     4.47%  [k] __local_bh_enable_ip
+     4.26%  [k] _raw_spin_unlock_irqrestore
+     1.85%  [k] __arch_copy_from_user
+     1.83%  [.] 0x0000000000087c8c
+     1.68%  [k] nft_do_chain
+     1.44%  [k] _raw_spin_unlock_irq
+     1.16%  [k] __arch_copy_to_user
+     1.05%  [k] handle_softirqs
+## perf report, fix_auto (self time, symbols >= 1%, both daemons)
+     4.94%  [k] __local_bh_enable_ip
+     4.81%  [k] _raw_spin_unlock_irqrestore
+     4.12%  [k] uaccess_ttbr0_enable.isra.0
+     3.92%  [k] uaccess_ttbr0_disable.isra.0
+     3.00%  [k] el0_svc
+     2.34%  [k] uaccess_ttbr0_disable.isra.0
+     2.34%  [k] uaccess_ttbr0_enable.isra.0
+     2.22%  [.] 0x0000000000087f20
+     2.05%  [k] nft_do_chain
+     1.78%  [k] _raw_spin_unlock_irq
+     1.27%  [.] recvfrom
+     1.16%  [k] handle_softirqs
+     1.00%  [k] __arch_copy_from_user
+     1.00%  [k] percpu_counter_add_batch
+
+## no-drop-rate quick run with the fix (run_quick_pi.sh, RUST=./udp2raw-fix) + old control
+# 2026-08-28T00:40:06+08:00 host=test-site-1 kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=58C load=0.89 0.88 0.88
+# no-drop-rate search hi=32000 secs=2 iter=5 max_loss=0.02 size=1300 bench=./udpbench2
+# cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-fix (f786a8c4) old=/opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+  ndr-iter rust_current_t0 rate=16000 offered=15957 sent=31936 recv=27847 loss=0.1280 server_cpu=88% client_cpu=98% sys_busy=276% irq=62%
+  ndr-iter rust_current_t0 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=52% client_cpu=50% sys_busy=156% irq=33%
+  ndr-iter rust_current_t0 rate=12000 offered=11968 sent=23936 recv=23936 loss=0.0000 server_cpu=77% client_cpu=74% sys_busy=184% irq=50%
+  ndr-iter rust_current_t0 rate=14000 offered=13983 sent=27968 recv=27968 loss=0.0000 server_cpu=87% client_cpu=86% sys_busy=207% irq=55%
+  ndr-iter rust_current_t0 rate=15000 offered=14976 sent=29952 recv=28707 loss=0.0416 server_cpu=89% client_cpu=93% sys_busy=260% irq=75%
+NDR rust_current_t0 | ndr_pps=13984 mbps=145 size=1300 | server_cpu=87% client_cpu=86% sys_busy=207% sys_irq=55% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=61.8C
+  ndr-iter rust_chacha_t0 rate=16000 offered=15932 sent=31936 recv=27392 loss=0.1423 server_cpu=85% client_cpu=86% sys_busy=253% irq=97%
+  ndr-iter rust_chacha_t0 rate=8000 offered=7967 sent=15936 recv=15936 loss=0.0000 server_cpu=52% client_cpu=48% sys_busy=213% irq=76%
+  ndr-iter rust_chacha_t0 rate=12000 offered=11967 sent=23936 recv=22305 loss=0.0681 server_cpu=69% client_cpu=68% sys_busy=277% irq=89%
+  ndr-iter rust_chacha_t0 rate=10000 offered=9983 sent=19968 recv=19968 loss=0.0000 server_cpu=64% client_cpu=60% sys_busy=268% irq=75%
+  ndr-iter rust_chacha_t0 rate=11000 offered=10974 sent=21952 recv=21482 loss=0.0214 server_cpu=71% client_cpu=65% sys_busy=261% irq=90%
+NDR rust_chacha_t0 | ndr_pps=9984 mbps=104 size=1300 | server_cpu=64% client_cpu=60% sys_busy=268% sys_irq=75% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.10s | warnlines=0 temp=65.7C
+  ndr-iter rust_current_t2 rate=16000 offered=15940 sent=31936 recv=29618 loss=0.0726 server_cpu=104% client_cpu=112% sys_busy=300% irq=83%
+  ndr-iter rust_current_t2 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=64% client_cpu=60% sys_busy=168% irq=47%
+  ndr-iter rust_current_t2 rate=12000 offered=11968 sent=23936 recv=23936 loss=0.0000 server_cpu=94% client_cpu=91% sys_busy=240% irq=64%
+  ndr-iter rust_current_t2 rate=14000 offered=13982 sent=27968 recv=27968 loss=0.0000 server_cpu=102% client_cpu=104% sys_busy=260% irq=76%
+  ndr-iter rust_current_t2 rate=15000 offered=14975 sent=29952 recv=29952 loss=0.0000 server_cpu=112% client_cpu=111% sys_busy=243% irq=60%
+NDR rust_current_t2 | ndr_pps=14976 mbps=156 size=1300 | server_cpu=112% client_cpu=111% sys_busy=243% sys_irq=60% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.10s | warnlines=0 temp=64.8C
+  ndr-iter rust_chacha_t2 rate=16000 offered=15968 sent=31936 recv=31760 loss=0.0055 server_cpu=105% client_cpu=105% sys_busy=256% irq=64%
+  ndr-iter rust_chacha_t2 rate=24000 offered=23968 sent=47936 recv=34045 loss=0.2898 server_cpu=107% client_cpu=108% sys_busy=304% irq=79%
+  ndr-iter rust_chacha_t2 rate=20000 offered=19920 sent=39872 recv=36734 loss=0.0787 server_cpu=114% client_cpu=114% sys_busy=294% irq=76%
+  ndr-iter rust_chacha_t2 rate=18000 offered=17981 sent=35968 recv=35968 loss=0.0000 server_cpu=114% client_cpu=114% sys_busy=255% irq=76%
+  ndr-iter rust_chacha_t2 rate=19000 offered=18975 sent=37952 recv=37726 loss=0.0060 server_cpu=117% client_cpu=116% sys_busy=268% irq=76%
+NDR rust_chacha_t2 | ndr_pps=18863 mbps=196 size=1300 | server_cpu=117% client_cpu=116% sys_busy=268% sys_irq=76% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=64.3C
+  ndr-iter old_current_t0 rate=16000 offered=15968 sent=31936 recv=30317 loss=0.0507 server_cpu=93% client_cpu=100% sys_busy=227% irq=56%
+  ndr-iter old_current_t0 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=50% client_cpu=50% sys_busy=135% irq=34%
+  ndr-iter old_current_t0 rate=12000 offered=11968 sent=23936 recv=23936 loss=0.0000 server_cpu=75% client_cpu=75% sys_busy=181% irq=46%
+  ndr-iter old_current_t0 rate=14000 offered=13983 sent=27968 recv=27968 loss=0.0000 server_cpu=87% client_cpu=90% sys_busy=210% irq=57%
+  ndr-iter old_current_t0 rate=15000 offered=14976 sent=29952 recv=28971 loss=0.0328 server_cpu=92% client_cpu=98% sys_busy=264% irq=65%
+NDR old_current_t0 | ndr_pps=13984 mbps=145 size=1300 | server_cpu=87% client_cpu=90% sys_busy=210% sys_irq=57% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=64.8C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+# udp2raw-test-site-1.service: active; wg1 latest handshake: 39s ago
+# done 2026-08-28T00:42:46+08:00 temp=63C
+
+## re-run of rust_chacha_t0: the case above was disturbed by background load (irq 89-97%, sys_busy 213% at 8k pps)
+# 2026-08-28T00:43:40+08:00 host=test-site-1 kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=57C load=1.58 1.54 1.17
+# no-drop-rate search hi=32000 secs=2 iter=5 max_loss=0.02 size=1300 bench=./udpbench2
+# cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-fix (f786a8c4) old=/opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+  ndr-iter rust_chacha_t0 rate=16000 offered=15966 sent=31936 recv=31936 loss=0.0000 server_cpu=85% client_cpu=86% sys_busy=213% irq=69%
+  ndr-iter rust_chacha_t0 rate=24000 offered=23967 sent=47936 recv=35990 loss=0.2492 server_cpu=96% client_cpu=99% sys_busy=244% irq=85%
+  ndr-iter rust_chacha_t0 rate=20000 offered=19967 sent=39936 recv=36778 loss=0.0791 server_cpu=98% client_cpu=100% sys_busy=235% irq=75%
+  ndr-iter rust_chacha_t0 rate=18000 offered=17983 sent=35968 recv=34303 loss=0.0463 server_cpu=92% client_cpu=97% sys_busy=266% irq=71%
+  ndr-iter rust_chacha_t0 rate=17000 offered=16984 sent=33984 recv=31642 loss=0.0689 server_cpu=91% client_cpu=93% sys_busy=283% irq=73%
+NDR rust_chacha_t0 | ndr_pps=15968 mbps=166 size=1300 | server_cpu=85% client_cpu=86% sys_busy=213% sys_irq=69% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=61.8C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+# udp2raw-test-site-1.service: active; wg1 latest handshake: 6s ago
+# done 2026-08-28T00:44:13+08:00 temp=62C

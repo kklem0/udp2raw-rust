@@ -20,8 +20,8 @@ how to test on the Pis. Keep the **Status** section current.
 | Server (many clients, conv sockets, connection recovery, GC) | done |
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
-| Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`) |
-| Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`) | **done 2026-08-27** — see the "Raspberry Pi 4" sections below; Pi 5 and a two-box measurement still to do |
+| Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
+| Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below; Pi 5 and a two-box measurement still to do |
 
 Docker e2e results are appended at the bottom of this file after each run.
 
@@ -101,20 +101,18 @@ Threading model (the reason for the port):
 
 Done since the first hand-off: worker handoff batching (`77276c9`), busy-poll fix
 (`8f1b17b`), `recvmmsg`/`sendmmsg` on the I/O thread with pooled buffers and in-place
-crypto (`1a7fd3b`), `--cipher-mode chacha20poly1305` (AEAD, Rust↔Rust), a real
+crypto (`1a7fd3b`; per-packet `recvfrom`/`sendto` on ARMv8.0 CPUs since `--syscalls`,
+2026-08-28), `--cipher-mode chacha20poly1305` (AEAD, Rust↔Rust), a real
 `--unit-test`, e2e coverage for `easy-faketcp` and for `--lower-level auto` over a veth
 pair in a network namespace (also C++ interop across it).
 
-* **The batched-I/O build spends more system time on the Pi 4 than `60a36d6`** (measured
-  2026-08-27, see "chacha20poly1305 vs the deployed mode" below): at a fixed 10k pps the
-  `--threads 0` daemons are at 46/52 % sys vs 36/40 % before, user time slightly lower;
-  no-drop rate 12.0k vs 14.0k pps. Not yet understood. Profile in Docker with
-  `--aes-backend table` (`perf`, `strace -c` on both builds at a fixed rate with
-  `bench_fixed.sh`). Things to check: `mmsghdr`/iovec copies per message, the 32 × 64 KB
-  receive buffers cycling through the cache instead of one hot buffer, zero-timeout polls.
-* **Measure again**: the deployment shape (Pi client ↔ VPS server over eth0) and the Pi 5.
-  `bench.sh quick` in Docker is the ~1 min regression check; `tools/bench/run_quick_pi.sh`
-  the ~30 s-per-case Pi check (`FIXED=<pps>` gives the user/sys split per daemon).
+* `--syscalls auto` decides from the LSE-atomics hwcap (ARMv8.0 → per-packet syscalls). A
+  kernel built without `CONFIG_ARM64_SW_TTBR0_PAN` on such a CPU would do marginally better
+  with `mmsg` (untested; the Docker numbers say the difference is a few percent at most).
+* **Measure again**: the deployment shape (Pi client ↔ VPS server over eth0) and the Pi 5
+  (hardware PAN and AES: expect `mmsg` + `hw`). `bench.sh quick` in Docker is the ~1 min
+  regression check; `tools/bench/run_quick_pi.sh` the ~30 s-per-case Pi check (`FIXED=<pps>`
+  gives the user/sys split per daemon); `tools/bench/sysprof_pi.sh` the syscall/PMU profile.
 * TPACKET_V3 ring for RX; write headers into headroom of the job buffer to drop the last
   copy on the TX path.
 * CBC decrypt already batches blocks (`decrypt_blocks`); CBC encrypt is inherently serial.
@@ -313,10 +311,8 @@ What the numbers mean:
   (sys 46–59 % vs user 14–30 % per daemon).
 * **The batched-I/O build (`1a7fd3b`) spends more system time here than `60a36d6`**:
   same session, same generator — old t0 13,984 pps vs HEAD 11,968; at 10k pps sys 46/52 %
-  vs 36/40 % per daemon while user time is slightly *lower* (in-place crypto). Batching was
-  added for the Docker box, where the I/O thread was at 100 % at 265k pps; the Pi 4 at
-  10–15k pps does not gain from it and the AES-CBC `--threads 0` case pays. Open item under
-  "Known gaps".
+  vs 36/40 % per daemon while user time is slightly *lower* (in-place crypto). Root cause
+  and fix in the next section (`--syscalls`); the table above is the *unfixed* build.
 * The C++ reproduced its earlier figure (9,984 vs 10,220). The `--threads 2` ceiling was
   15k pps in this session vs 18.7k in the earlier quick run (generator burst shape and
   router load differ between sessions) — compare rows only within one session.
@@ -324,7 +320,83 @@ What the numbers mean:
   `rmem_max`/`wmem_max` back at 212992 and the governor at `ondemand`, no leftover
   processes, production daemon active, WireGuard handshakes continuing, temperature ≤ 63 °C.
 
+## Why the batched-I/O build was slower on the Pi 4, and the fix (2026-08-28)
+
+Symptom (previous section): same box, same generator, `60a36d6` (one `recvfrom`/`sendto`
+per packet) reached 13,984 pps single-threaded, HEAD with `recvmmsg`/`sendmmsg` 11,968, and
+at a fixed 10k pps HEAD's daemons spent 46/52 % in the kernel vs 36/40 % — with *lower* user
+time. Docker (arm64 VM, kernel 6.12) showed no difference at all. Tool:
+`tools/bench/sysprof_pi.sh` (fixed rate; user/sys split, context switches, per-syscall kernel
+time from the tracefs `raw_syscalls` tracepoints, PMU counters and a `perf` profile per
+daemon); raw logs `docs/bench/pi4-syscalls-2026-08-28.txt` and
+`docs/bench/docker-syscalls-2026-08-28.txt`.
+
+1. Syscall counts (`strace -c` in Docker): HEAD makes far *fewer* syscalls — 50k packets cost
+   the client 788 `sendmmsg` + 2,350 `recvmmsg` + 1,578 `epoll_pwait` instead of 37k
+   `sendto` + 37k `recvfrom`. (The server's UDP replies are one `sendto` per packet in both.)
+2. Kernel time per syscall on the Pi (tracepoints, 5k pps): `recvfrom` 9.3 µs and `sendto`
+   27 µs per packet; `recvmmsg` 19 µs and `sendmmsg` 36 µs *per packet*, with only 10–20
+   packets per call. The batched calls cost about twice as much per packet.
+3. Not scheduling: pinning server, client and generator to separate cores cut involuntary
+   context switches 5× for both builds and left the gap untouched (sys 35/37 % vs 45/51 %).
+4. PMU counters: HEAD retires ~10k *more instructions* per packet (server 96.8k → 105.4k,
+   client 101k → 115k) at the same IPC and with fewer L1 misses — extra kernel work, not
+   stalls, contention or cache thrashing.
+5. `perf`: the only symbols that grow are `uaccess_ttbr0_enable`/`uaccess_ttbr0_disable` —
+   25.7 % of HEAD's samples vs 12.2 % of `60a36d6`'s; netfilter, softirq and spinlocks are
+   identical. The Cortex-A72 is ARMv8.0 and has no hardware PAN, so the Ubuntu kernel
+   (`CONFIG_ARM64_SW_TTBR0_PAN`) switches TTBR0 with an ISB around *every* user-memory access
+   inside a syscall. `recvmmsg` touches the caller's `mmsghdr`, iovec, address,
+   `msg_namelen`, `msg_flags`, `msg_controllen` and `msg_len` per message (~8 switches per
+   packet vs 3 for `recvfrom`; `sendmmsg` ~5 vs 2 for `sendto`), and each switch costs
+   ~1–2k cycles here. On CPUs with hardware PAN (ARMv8.1+: Pi 5, the Docker VM) the switch is
+   a single instruction, which is why Docker never showed it.
+
+Fix — `--syscalls auto|mmsg|single` (`types::Syscalls`, `net::set_syscalls`): the batched
+drain loop, pooled buffers and deferred flush stay; only the kernel calls change. `single` =
+one `recvfrom`/`sendto` per packet inside the same batch structure; `auto` = `single` on
+aarch64 CPUs without LSE atomics (LSE and PAN both arrived in ARMv8.1, so "no LSE" =
+Cortex-A53/A72 class), `mmsg` otherwise. The startup log shows the choice:
+`syscalls: single (requested auto; cpu lse atomics: false)`.
+
+Pi 4, fixed 10k pps, per daemon (server / client):
+
+| build | user / sys | cycles per packet | instructions per packet |
+|---|---|---|---|
+| `60a36d6` (per-packet syscalls) | 29 / 36 %, 27 / 40 % | 87.0k / 86.9k | 96.8k / 101k |
+| HEAD `3c380ad` (mmsg) | 28 / 47 %, 24 / 53 % | 92.8k / 96.4k | 105k / 115k |
+| fixed, `--syscalls auto` → single | 27 / 39 %, 23 / 40 % | **83.8k / 81.5k** | 96.8k / 98.5k |
+| fixed, `--syscalls mmsg` (control) | 28 / 48 %, 23 / 53 % | — | — |
+
+Pi 4 no-drop rate, same setup as the previous section (`docs/bench/pi4-syscalls-2026-08-28.txt`):
+
+| case | fixed build | HEAD `3c380ad` (mmsg) | `60a36d6` |
+|---|---:|---:|---:|
+| aes128cbc + md5, `--threads 0` | 13,984 (87 % / 86 %) | 11,968 (88 % / 89 %) | 13,984 (87 % / 90 %) |
+| chacha20poly1305, `--threads 0` | **15,968** (85 % / 86 %) | 13,984 (86 % / 92 %) | — |
+| aes128cbc + md5, `--threads 2` | 14,976 (112 % / 111 %) | 14,818 (117 % / 121 %) | 14,976 (110 % / 112 %) |
+| chacha20poly1305, `--threads 2` | **18,863** (117 % / 116 %) | 14,976 (108 % / 108 %) | — |
+
+The fixed build matches the old build's rate at slightly less CPU in the deployed mode, and
+with chacha it goes past what looked like a 15k pps kernel ceiling (18.9k with `--threads 2`).
+
+Docker (fast cores, hardware PAN, split cores; `docs/bench/docker-syscalls-2026-08-28.txt`):
+`mmsg` vs `single` is 137k vs 124–135k pps at `--threads 0` (table AES), 298k vs 298k at
+`--threads 2` (table) and 311–323k vs 282–308k at `--threads 2` (hardware AES) — a few
+percent at most, so `auto` keeps `mmsg` there. The `single` path is covered by the Docker
+e2e with `RUST_EXTRA="--syscalls single"` (25/25 pass, 2026-08-28; the hook adds options to
+the Rust daemons only, so the C++ interop cases still run).
+
+Lesson: on ARMv8.0 cores the expensive part of a syscall is not the entry but every
+user-memory access inside it, so APIs that write per-message bookkeeping back to user space
+lose to the plain calls — measure on the target CPU, not on a stand-in.
+
 ## e2e run log
+
+### 2026-08-28 — same suite, `RUST_EXTRA="--syscalls single"` (per-packet recvfrom/sendto path)
+
+25/25 pass (`tools/docker/e2e.sh`, Docker Desktop arm64, `--cap-add NET_RAW,NET_ADMIN,SYS_ADMIN`,
+C++ reference built from `~/git/udp2raw`); every probe 2000/2000.
 
 ### 2026-08-27 — Docker Desktop (Apple Silicon), `rust:1-bookworm` arm64, loopback
 
