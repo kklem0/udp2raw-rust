@@ -45,18 +45,20 @@ try_rate() { # RATE -> sets STEADY SCPU CCPU SYSB SYSQ
     CCPU=$(awk "BEGIN{printf \"%.0f\", ($C1-$C0)/$HZ/$DT*100}")
     SYSB=$(awk "BEGIN{printf \"%.0f\", ($B1-$B0)/$HZ/$DT*100}")
     SYSQ=$(awk "BEGIN{printf \"%.0f\", ($Q1-$Q0)/$HZ/$DT*100}")
-    # steady = mean of the per-second samples after the first second, before the last
-    STEADY=$(grep "^t=" "$LOGDIR/$NAME.sink.log" | awk '{sub("pps=","",$2); print $2}' | sed '1d;$d' | awk '{s+=$1; n++} END{if(n>0) printf "%.0f", s/n; else print 0}')
+    # exact counts: everything the sink received (it runs 2 s longer than the blast) vs sent
+    RECV=$(grep -h '^sink:' "$LOGDIR/$NAME.sink.log" | sed 's/.*packets=\([0-9]*\).*/\1/')
+    SENT=$(grep -h '^blast:' "$LOGDIR/$NAME.blast.log" | sed 's/.*packets=\([0-9]*\).*/\1/')
     OFFERED=$(grep -h '^blast:' "$LOGDIR/$NAME.blast.log" | sed 's/.*pps=\([0-9]*\).*/\1/')
+    STEADY=$(awk "BEGIN{printf \"%.0f\", ${RECV:-0}/$SECS}")
 }
 
 lo=0; hi=$HI; best=0; best_line=""
 for _ in $(seq 1 "$ITER"); do
     rate=$(( (lo + hi) / 2 ))
     try_rate $rate
-    loss=$(awk "BEGIN{ if ($rate>0) printf \"%.4f\", 1 - $STEADY/$rate; else print 1 }")
+    loss=$(awk "BEGIN{ if (${SENT:-0}>0) printf \"%.4f\", 1 - ${RECV:-0}/$SENT; else print 1 }")
     ok=$(awk "BEGIN{print ($loss <= $MAX_LOSS) ? 1 : 0}")
-    echo "  ndr-iter $NAME rate=$rate offered=$OFFERED steady=$STEADY loss=$loss server_cpu=${SCPU}% client_cpu=${CCPU}% sys_busy=${SYSB}% irq=${SYSQ}%"
+    echo "  ndr-iter $NAME rate=$rate offered=$OFFERED sent=$SENT recv=$RECV loss=$loss server_cpu=${SCPU}% client_cpu=${CCPU}% sys_busy=${SYSB}% irq=${SYSQ}%"
     if [ "$ok" = 1 ]; then
         lo=$rate; best=$STEADY
         best_line="server_cpu=${SCPU}% client_cpu=${CCPU}% sys_busy=${SYSB}% sys_irq=${SYSQ}%"
