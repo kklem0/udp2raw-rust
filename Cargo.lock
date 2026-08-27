@@ -97,6 +97,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.3.0",
+ "rand_core",
 ]
 
 [[package]]
@@ -416,6 +417,7 @@ name = "udp2raw"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "chacha20",
  "chacha20poly1305",
  "clap",
  "cpufeatures 0.2.17",

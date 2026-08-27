@@ -1,0 +1,24 @@
+# 2026-08-28 01:11 +08:00 test-site-1 (Raspberry Pi 4, Cortex-A72 x4 @1.8GHz, Ubuntu 24.04, kernel 6.8.0-1047-raspi)
+# chacha20poly1305 after the switch to XChaCha20-Poly1305 with random 24-byte nonces ([nonce 24][ciphertext][tag 16], +40 bytes),
+# build 79a6e261 = c68ddf1 + XChaCha, --syscalls auto (single on this CPU). Same setup as pi4-chacha-2026-08-27.txt: loopback, both daemons
+# on the box, 1300-byte datagrams, -a --fix-gro, udpbench2 64-packet bursts, no-drop-rate search ITER=5 SECS=2 HI=32000 (<= 2% loss).
+# Reference (12-byte nonce build f786a8c4, quick-fix runs): chacha t0 15,968 pps at 85%/86%, chacha t2 18,863 at 117%/116%.
+# 2026-08-28T01:11:12+08:00 host=test-site-1 kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=56C load=0.83 0.66 0.80
+# no-drop-rate search hi=32000 secs=2 iter=5 max_loss=0.02 size=1300 bench=./udpbench2
+# cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-xchacha (79a6e261) old=/opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+  ndr-iter rust_chacha_t0 rate=16000 offered=15968 sent=31936 recv=31936 loss=0.0000 server_cpu=89% client_cpu=87% sys_busy=229% irq=67%
+  ndr-iter rust_chacha_t0 rate=24000 offered=23967 sent=47936 recv=34580 loss=0.2786 server_cpu=93% client_cpu=100% sys_busy=238% irq=78%
+  ndr-iter rust_chacha_t0 rate=20000 offered=19967 sent=39936 recv=35868 loss=0.1019 server_cpu=97% client_cpu=100% sys_busy=231% irq=75%
+  ndr-iter rust_chacha_t0 rate=18000 offered=17982 sent=35968 recv=33827 loss=0.0595 server_cpu=93% client_cpu=97% sys_busy=242% irq=78%
+  ndr-iter rust_chacha_t0 rate=17000 offered=16983 sent=33984 recv=33984 loss=0.0000 server_cpu=94% client_cpu=94% sys_busy=256% irq=69%
+NDR rust_chacha_t0 | ndr_pps=16992 mbps=177 size=1300 | server_cpu=94% client_cpu=94% sys_busy=256% sys_irq=69% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.09s | warnlines=0 temp=60.4C
+  ndr-iter rust_chacha_t2 rate=16000 offered=15967 sent=31936 recv=31359 loss=0.0181 server_cpu=102% client_cpu=102% sys_busy=280% irq=68%
+  ndr-iter rust_chacha_t2 rate=24000 offered=23888 sent=47808 recv=36702 loss=0.2323 server_cpu=113% client_cpu=113% sys_busy=300% irq=79%
+  ndr-iter rust_chacha_t2 rate=20000 offered=19967 sent=39936 recv=39936 loss=0.0000 server_cpu=121% client_cpu=121% sys_busy=277% irq=81%
+  ndr-iter rust_chacha_t2 rate=22000 offered=21972 sent=43968 recv=39967 loss=0.0910 server_cpu=120% client_cpu=123% sys_busy=289% irq=80%
+  ndr-iter rust_chacha_t2 rate=21000 offered=20977 sent=41984 recv=37695 loss=0.1022 server_cpu=115% client_cpu=117% sys_busy=287% irq=80%
+NDR rust_chacha_t2 | ndr_pps=19968 mbps=208 size=1300 | server_cpu=121% client_cpu=121% sys_busy=277% sys_irq=81% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.09s | warnlines=0 temp=61.8C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+# udp2raw-test-site-1.service: active; wg1 latest handshake: 9s ago
+# done 2026-08-28T01:12:17+08:00 temp=59C
