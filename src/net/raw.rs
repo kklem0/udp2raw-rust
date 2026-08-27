@@ -116,6 +116,11 @@ impl RawSockets {
         Ok(())
     }
 
+    /// Receive up to a batch of packets (IP header first) with their link-layer sources.
+    pub fn recv_batch(&self, b: &mut super::RecvBatch<libc::sockaddr_ll>) -> io::Result<usize> {
+        b.recv(self.recv_fd)
+    }
+
     /// Receive one packet (IP header first) and the link-layer source (for `--lower-level auto`).
     /// Returns `Ok(None)` when the socket has no more packets (EAGAIN).
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<Option<(usize, libc::sockaddr_ll)>> {

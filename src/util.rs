@@ -167,6 +167,31 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A free list of reusable packet buffers (single-thread use).
+pub struct BufPool {
+    free: Vec<Vec<u8>>,
+    buf_cap: usize,
+    max_free: usize,
+}
+
+impl BufPool {
+    pub fn new(buf_cap: usize, max_free: usize) -> BufPool {
+        BufPool { free: Vec::with_capacity(max_free), buf_cap, max_free }
+    }
+
+    /// An empty buffer with at least `buf_cap` capacity.
+    pub fn take(&mut self) -> Vec<u8> {
+        self.free.pop().unwrap_or_else(|| Vec::with_capacity(self.buf_cap))
+    }
+
+    pub fn recycle(&mut self, mut b: Vec<u8>) {
+        if self.free.len() < self.max_free && b.capacity() >= self.buf_cap {
+            b.clear();
+            self.free.push(b);
+        }
+    }
+}
+
 /// Constant-time equality for MAC tags.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

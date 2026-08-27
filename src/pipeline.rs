@@ -14,7 +14,7 @@
 //! `eventfd` wake) which otherwise rivals the crypto itself on CPUs with AES instructions.
 //! With `n == 0` the work is done inline and the API is unchanged.
 
-use crate::conn::{decrypt_safer, encrypt_safer};
+use crate::conn::{decrypt_safer_vec, encrypt_safer_vec};
 use crate::crypto::Crypto;
 use crate::faketcp::RecvMeta;
 use std::collections::VecDeque;
@@ -45,9 +45,9 @@ pub enum Done {
 
 fn process(job: Job, crypto: &Crypto, fix_gro: bool) -> Done {
     match job {
-        Job::Encrypt { key, plain } => Done::Encrypted { key, wire: encrypt_safer(crypto, &plain, fix_gro) },
-        Job::Decrypt { key, mut wire, meta } => {
-            let plains = decrypt_safer(crypto, &mut wire, fix_gro);
+        Job::Encrypt { key, plain } => Done::Encrypted { key, wire: encrypt_safer_vec(crypto, plain, fix_gro) },
+        Job::Decrypt { key, wire, meta } => {
+            let plains = decrypt_safer_vec(crypto, wire, fix_gro);
             Done::Decrypted { key, plains, meta }
         }
     }

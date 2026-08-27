@@ -64,13 +64,19 @@ pub struct SaferHeader {
 
 pub fn build_safer(h: &SaferHeader, payload: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(SAFER_HEADER_LEN + payload.len());
-    v.extend_from_slice(&h.my_id.to_be_bytes());
-    v.extend_from_slice(&h.oppsite_id.to_be_bytes());
-    v.extend_from_slice(&h.seq.to_be_bytes());
-    v.push(h.ptype);
-    v.push(h.roller);
-    v.extend_from_slice(payload);
+    build_safer_into(h, payload, &mut v);
     v
+}
+
+/// Append the safer plaintext (`header || payload`) to `out` (which is cleared first).
+pub fn build_safer_into(h: &SaferHeader, payload: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(&h.my_id.to_be_bytes());
+    out.extend_from_slice(&h.oppsite_id.to_be_bytes());
+    out.extend_from_slice(&h.seq.to_be_bytes());
+    out.push(h.ptype);
+    out.push(h.roller);
+    out.extend_from_slice(payload);
 }
 
 /// The ids and sequence number of a decrypted safer packet. Split from
@@ -124,14 +130,19 @@ pub fn parse_data_payload(data: &[u8]) -> Option<(u32, &[u8])> {
 /// `--fix-gro` sender side: prefix the encrypted packet with its length and obfuscate the
 /// head so a GRO-merged burst can be split again by the receiver.
 pub fn gro_wrap(crypto: &Crypto, encrypted: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(encrypted.len() + 2);
-    v.extend_from_slice(&[0, 0]);
-    v.extend_from_slice(encrypted);
-    write_u16_be(&mut v[..2], encrypted.len() as u16);
-    if v.len() >= 16 || !crypto.cipher_mode().is_aes() {
-        crypto.gro_obfuscate_head(&mut v);
-    }
+    let mut v = encrypted.to_vec();
+    gro_wrap_in_place(crypto, &mut v);
     v
+}
+
+/// In-place variant of [`gro_wrap`].
+pub fn gro_wrap_in_place(crypto: &Crypto, buf: &mut Vec<u8>) {
+    let len = buf.len();
+    buf.splice(0..0, [0u8, 0u8]);
+    write_u16_be(&mut buf[..2], len as u16);
+    if buf.len() >= 16 || !crypto.cipher_mode().is_aes() {
+        crypto.gro_obfuscate_head(buf);
+    }
 }
 
 /// `--fix-gro` receiver side: split a (possibly GRO-merged) buffer into the individual
