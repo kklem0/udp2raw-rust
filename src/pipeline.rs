@@ -1,13 +1,18 @@
 //! Ordered crypto pipeline.
 //!
-//! The I/O thread owns every socket and all connection state. It hands each packet's
-//! encrypt/decrypt work to one of `n` worker threads in strict round-robin and collects
-//! the results in the same round-robin order, so completions are delivered in submission
-//! order without any reorder buffer (each worker's queue is FIFO). With `n == 0` the work
-//! is done inline and the API is unchanged.
+//! The I/O thread owns every socket and all connection state. It hands packets' encrypt /
+//! decrypt work to `n` worker threads and collects the results in the same order, so
+//! completions are delivered in submission order without any reorder buffer:
 //!
-//! Workers signal the I/O thread through a shared `eventfd`, which the caller registers
-//! with its poller.
+//! * jobs are accumulated into a batch (up to [`BATCH_JOBS`]) while the I/O thread drains
+//!   its sockets; a full batch, or [`Pipeline::flush`] at the end of the round, sends it to
+//!   the next worker in strict round-robin;
+//! * each worker processes its batches FIFO and returns one result vector per batch;
+//! * the I/O thread collects from the workers in the same round-robin order.
+//!
+//! Batching amortises the per-packet cost of the handoff (a channel message plus an
+//! `eventfd` wake) which otherwise rivals the crypto itself on CPUs with AES instructions.
+//! With `n == 0` the work is done inline and the API is unchanged.
 
 use crate::conn::{decrypt_safer, encrypt_safer};
 use crate::crypto::Crypto;
@@ -49,8 +54,8 @@ fn process(job: Job, crypto: &Crypto, fix_gro: bool) -> Done {
 }
 
 struct Worker {
-    tx: SyncSender<Job>,
-    rx: Receiver<Done>,
+    tx: SyncSender<Vec<Job>>,
+    rx: Receiver<Vec<Done>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -59,15 +64,18 @@ pub struct Pipeline {
     wake_fd: RawFd,
     next_dispatch: usize,
     next_collect: usize,
-    in_flight: usize,
+    in_flight_batches: usize,
+    batch: Vec<Job>,
     inline_done: VecDeque<Done>,
     crypto: Arc<Crypto>,
     fix_gro: bool,
     dropped: u64,
 }
 
-/// Queue depth per worker; beyond this the I/O thread drops packets (overload).
-pub const QUEUE_DEPTH: usize = 512;
+/// Jobs per batch handed to a worker.
+pub const BATCH_JOBS: usize = 16;
+/// Batches queued per worker; beyond this the I/O thread drops packets (overload).
+pub const QUEUE_DEPTH: usize = 64;
 
 impl Pipeline {
     pub fn new(threads: usize, crypto: Arc<Crypto>, fix_gro: bool) -> io::Result<Pipeline> {
@@ -82,13 +90,13 @@ impl Pipeline {
         };
         let mut workers = Vec::with_capacity(threads);
         for i in 0..threads {
-            let (job_tx, job_rx) = sync_channel::<Job>(QUEUE_DEPTH);
-            let (done_tx, done_rx) = sync_channel::<Done>(QUEUE_DEPTH);
+            let (job_tx, job_rx) = sync_channel::<Vec<Job>>(QUEUE_DEPTH);
+            let (done_tx, done_rx) = sync_channel::<Vec<Done>>(QUEUE_DEPTH);
             let crypto = crypto.clone();
             let handle = std::thread::Builder::new().name(format!("udp2raw-crypto-{i}")).spawn(move || {
-                while let Ok(job) = job_rx.recv() {
-                    let done = process(job, &crypto, fix_gro);
-                    if done_tx.send(done).is_err() {
+                while let Ok(batch) = job_rx.recv() {
+                    let dones: Vec<Done> = batch.into_iter().map(|j| process(j, &crypto, fix_gro)).collect();
+                    if done_tx.send(dones).is_err() {
                         break;
                     }
                     let one: u64 = 1;
@@ -99,7 +107,18 @@ impl Pipeline {
             })?;
             workers.push(Worker { tx: job_tx, rx: done_rx, handle: Some(handle) });
         }
-        Ok(Pipeline { workers, wake_fd, next_dispatch: 0, next_collect: 0, in_flight: 0, inline_done: VecDeque::new(), crypto, fix_gro, dropped: 0 })
+        Ok(Pipeline {
+            workers,
+            wake_fd,
+            next_dispatch: 0,
+            next_collect: 0,
+            in_flight_batches: 0,
+            batch: Vec::with_capacity(BATCH_JOBS),
+            inline_done: VecDeque::new(),
+            crypto,
+            fix_gro,
+            dropped: 0,
+        })
     }
 
     pub fn threads(&self) -> usize {
@@ -111,8 +130,9 @@ impl Pipeline {
         self.wake_fd
     }
 
+    /// Batches handed to workers and not yet collected, plus a pending partial batch.
     pub fn in_flight(&self) -> usize {
-        self.in_flight
+        self.in_flight_batches + usize::from(!self.batch.is_empty())
     }
 
     pub fn dropped(&self) -> u64 {
@@ -127,16 +147,32 @@ impl Pipeline {
             self.inline_done.push_back(done);
             return true;
         }
+        self.batch.push(job);
+        if self.batch.len() >= BATCH_JOBS {
+            return self.flush();
+        }
+        true
+    }
+
+    /// Hand the pending partial batch to a worker. Called automatically when a batch fills
+    /// and by [`collect`](Self::collect); the I/O loop calls it at the end of a drain round.
+    pub fn flush(&mut self) -> bool {
+        if self.batch.is_empty() || self.workers.is_empty() {
+            return true;
+        }
+        let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(BATCH_JOBS));
+        let n = batch.len() as u64;
         let w = &self.workers[self.next_dispatch];
-        match w.tx.try_send(job) {
+        match w.tx.try_send(batch) {
             Ok(()) => {
                 self.next_dispatch = (self.next_dispatch + 1) % self.workers.len();
-                self.in_flight += 1;
+                self.in_flight_batches += 1;
                 true
             }
             Err(TrySendError::Full(_)) => {
-                self.dropped += 1;
-                if self.dropped.is_power_of_two() {
+                let before = self.dropped;
+                self.dropped += n;
+                if (before >> 10) != (self.dropped >> 10) {
                     log::warn!("crypto pipeline overloaded, dropped {} packets so far", self.dropped);
                 }
                 false
@@ -148,7 +184,7 @@ impl Pipeline {
         }
     }
 
-    /// Deliver every completed job, in submission order, to `f`.
+    /// Flush the pending batch, then deliver every completed job, in submission order, to `f`.
     pub fn collect(&mut self, mut f: impl FnMut(Done)) {
         if self.workers.is_empty() {
             while let Some(d) = self.inline_done.pop_front() {
@@ -156,18 +192,21 @@ impl Pipeline {
             }
             return;
         }
+        self.flush();
         // drain the eventfd counter
         let mut v: u64 = 0;
         unsafe {
             libc::read(self.wake_fd, &mut v as *mut u64 as *mut libc::c_void, 8);
         }
-        while self.in_flight > 0 {
+        while self.in_flight_batches > 0 {
             let w = &self.workers[self.next_collect];
             match w.rx.try_recv() {
-                Ok(done) => {
+                Ok(dones) => {
                     self.next_collect = (self.next_collect + 1) % self.workers.len();
-                    self.in_flight -= 1;
-                    f(done);
+                    self.in_flight_batches -= 1;
+                    for d in dones {
+                        f(d);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -183,7 +222,7 @@ impl Drop for Pipeline {
     fn drop(&mut self) {
         for w in &mut self.workers {
             // dropping the sender ends the worker loop
-            let (dummy_tx, _) = sync_channel::<Job>(1);
+            let (dummy_tx, _) = sync_channel::<Vec<Job>>(1);
             let tx = std::mem::replace(&mut w.tx, dummy_tx);
             drop(tx);
         }
@@ -209,7 +248,7 @@ mod tests {
     }
 
     fn plain(i: u64) -> Vec<u8> {
-        build_safer(&SaferHeader { my_id: 1, oppsite_id: 2, seq: i, ptype: b'd', roller: 0 }, &[i as u8; 200])
+        build_safer(&SaferHeader { my_id: 1, oppsite_id: 2, seq: i, ptype: b'd', roller: 0 }, &vec![i as u8; 200])
     }
 
     #[test]
@@ -233,10 +272,12 @@ mod tests {
         let c = crypto();
         let server = Crypto::new(CipherMode::Aes128Cbc, AuthMode::Md5, false, Keys::derive("k", false));
         let mut p = Pipeline::new(3, c, false).unwrap();
-        let n = 200u64;
+        // 203 jobs: many full batches plus a partial one that only flush()/collect() sends
+        let n = 203u64;
         for i in 0..n {
             assert!(p.submit(Job::Encrypt { key: JobKey { slot: i as usize, generation: 7 }, plain: plain(i) }));
         }
+        assert!(p.in_flight() > 0);
         let mut seen = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while seen.len() < n as usize {
@@ -255,5 +296,19 @@ mod tests {
         }
         assert_eq!(seen, (0..n as usize).collect::<Vec<_>>());
         assert_eq!(p.in_flight(), 0);
+    }
+
+    #[test]
+    fn single_job_is_delivered_without_a_full_batch() {
+        let mut p = Pipeline::new(2, crypto(), false).unwrap();
+        assert!(p.submit(Job::Encrypt { key: JobKey { slot: 0, generation: 1 }, plain: plain(0) }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got = 0;
+        while got == 0 {
+            p.collect(|_| got += 1);
+            assert!(std::time::Instant::now() < deadline, "partial batch never flushed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(got, 1);
     }
 }
