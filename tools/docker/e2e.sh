@@ -58,14 +58,16 @@ wait_for() { # pattern file timeout
     return 1
 }
 
-# run_case NAME SERVER_BIN CLIENT_BIN "COMMON ARGS" "SERVER ARGS" "CLIENT ARGS" [PROBE ARGS]
+# run_case NAME SERVER_BIN CLIENT_BIN "COMMON ARGS" "SERVER ARGS" "CLIENT ARGS" [PROBE ARGS] [noa]
+#   noa: do not pass -a (easy-faketcp relies on the kernel's own TCP handshake)
 run_case() {
-    local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6 probe=${7:-"2000 1000 2"}
+    local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6 probe=${7:-"2000 1000 2"} noa=${8:-}
+    local A="-a"; [ "$noa" = noa ] && A=""
     echo "== case: $name"
     python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
-    $sbin -s -l 127.0.0.1:4096 -r 127.0.0.1:7777 -k pw -a $common $sargs > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
+    $sbin -s -l 127.0.0.1:4096 -r 127.0.0.1:7777 -k pw $A $common $sargs > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
     sleep 0.5
-    $cbin -c -l 127.0.0.1:3333 -r 127.0.0.1:4096 -k pw -a $common $cargs > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
+    $cbin -c -l 127.0.0.1:3333 -r 127.0.0.1:4096 -k pw $A $common $cargs > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
     local ok=1
     if ! wait_for "client_ready" "$LOGDIR/$name.client.log" 20; then
         echo "   client never became ready"; ok=0
@@ -86,10 +88,43 @@ run_case() {
     if [ $ok = 1 ]; then PASS=$((PASS + 1)); echo "   PASS"; else FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; echo "   FAIL (logs in $LOGDIR/$name.*)"; tail -5 "$LOGDIR/$name.client.log"; fi
 }
 
+# run_veth_case NAME SERVER_BIN CLIENT_BIN "COMMON" "SERVER ARGS" "CLIENT ARGS"
+# The server runs in network namespace "peer" behind a veth pair (10.99.0.2), the client in
+# the main namespace (10.99.0.1): a real interface path, and what --lower-level needs.
+veth_setup() {
+    ip netns del peer 2>/dev/null; ip link del veth0 2>/dev/null
+    ip netns add peer && ip link add veth0 type veth peer name veth1 && ip link set veth1 netns peer || return 1
+    ip addr add 10.99.0.1/24 dev veth0 && ip link set veth0 up
+    ip netns exec peer ip addr add 10.99.0.2/24 dev veth1 && ip netns exec peer ip link set veth1 up && ip netns exec peer ip link set lo up
+    ping -c1 -W1 10.99.0.2 >/dev/null 2>&1; ip netns exec peer ping -c1 -W1 10.99.0.1 >/dev/null 2>&1   # populate ARP
+}
+veth_teardown() { ip netns del peer 2>/dev/null; ip link del veth0 2>/dev/null; }
+run_veth_case() {
+    local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6
+    echo "== case: $name (veth)"
+    if ! veth_setup; then echo "   veth setup failed"; FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; return; fi
+    ip netns exec peer python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
+    ip netns exec peer $sbin -s -l 10.99.0.2:4096 -r 127.0.0.1:7777 -k pw -a $common $sargs > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
+    sleep 0.5
+    $cbin -c -l 127.0.0.1:3333 -r 10.99.0.2:4096 -k pw -a $common $cargs > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
+    local ok=1
+    if ! wait_for "client_ready" "$LOGDIR/$name.client.log" 20; then echo "   client never became ready"; ok=0
+    else sleep 0.3; python3 tools/udp_probe.py 127.0.0.1 3333 2000 1000 2 || ok=0; fi
+    cleanup
+    ip netns exec peer iptables -S 2>/dev/null | grep -q udp2rawDwrW && echo "WARN: leftover iptables rules in netns peer"
+    veth_teardown
+    if [ $ok = 1 ]; then PASS=$((PASS + 1)); echo "   PASS"; else FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; echo "   FAIL (logs in $LOGDIR/$name.*)"; tail -5 "$LOGDIR/$name.client.log"; tail -3 "$LOGDIR/$name.server.log"; fi
+}
+
 D="--log-level 4"
 if [ -n "$CPP" ]; then
     run_case cpp_cpp_baseline       "$CPP"  "$CPP"  "$D" "" ""
 fi
+run_case rust_rust_chacha           "$RUST" "$RUST" "$D --cipher-mode chacha20poly1305" "" ""
+run_case rust_rust_chacha_gro       "$RUST" "$RUST" "$D --cipher-mode chacha20poly1305 --fix-gro --threads 2" "" ""
+run_case rust_rust_easy_faketcp     "$RUST" "$RUST" "$D --raw-mode easy-faketcp" "" "" "2000 1000 2" noa
+run_veth_case rust_rust_veth        "$RUST" "$RUST" "$D" "" ""
+run_veth_case rust_rust_veth_lowerlevel "$RUST" "$RUST" "$D --lower-level auto" "" ""
 run_case rust_rust_default          "$RUST" "$RUST" "$D" "" ""
 run_case rust_rust_threads0         "$RUST" "$RUST" "$D" "--threads 0" "--threads 0"
 run_case rust_rust_threads3         "$RUST" "$RUST" "$D" "--threads 3" "--threads 3"
@@ -107,6 +142,9 @@ if [ -n "$CPP" ]; then
     run_case rust_server_cpp_client_icmp "$RUST" "$CPP" "$D --raw-mode icmp --cipher-mode xor --auth-mode crc32" "" ""
     run_case cpp_server_rust_client_udp "$CPP"  "$RUST" "$D --raw-mode udp --auth-mode simple" "" ""
     run_case rust_server_cpp_client_gro "$RUST" "$CPP"  "$D --fix-gro" "" ""
+    run_case cpp_server_rust_client_easy "$CPP" "$RUST" "$D --raw-mode easy-faketcp" "" "" "2000 1000 2" noa
+    run_veth_case cpp_server_rust_client_veth_lowerlevel "$CPP" "$RUST" "$D --lower-level auto" "" ""
+    run_veth_case rust_server_cpp_client_veth "$RUST" "$CPP" "$D" "" ""
 fi
 
 echo "== summary: pass=$PASS fail=$FAIL$FAILED_NAMES"
