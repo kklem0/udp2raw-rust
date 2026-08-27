@@ -104,7 +104,11 @@ duplicated answer never causes a switch; a genuinely new address is adopted at t
 reconnect boundary. Failed queries back off exponentially with jitter, and NXDOMAIN /
 SERVFAIL / timeout / malformed replies / a lost resolver never erase the current endpoint.
 `echo reconnect > <fifo>` forces a fresh query for a planned cutover without restarting.
-TTL is clamped to 10–3600 s; a healthy session is never interrupted by TTL expiry.
+TTL is clamped to 10–3600 s; a healthy session is never interrupted by TTL expiry. The
+lookup runs only from the reconnecting (idle) state, never during a healthy session, so it
+cannot stall live traffic; but note a reconnect can take up to `(servers × --dns-timeout)`
+longer while a `--dns-server` is unreachable (the current/last-known address is kept
+throughout).
 
 **DNS record recommendation:** publish exactly **one** unproxied IPv4 `A` record with a
 **30–60 second TTL**. Keep it a plain A record (no CDN/proxy in front — the tunnel must reach
