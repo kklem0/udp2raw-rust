@@ -22,6 +22,7 @@ how to test on the Pis. Keep the **Status** section current.
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
 | Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below; Pi 5 and a two-box measurement still to do |
+| **Production on the Pi 4** (`udp2raw-wutong.service`, faketcp client to the VPS, WireGuard inside) | **`0e0b3fa` deployed 2026-08-28 01:28** (`/opt/udp2raw-rust-0e0b3fa-arm64`, unchanged conf, `--syscalls auto` → single); replaced `60a36d6`. See "Deployment" below |
 
 Docker e2e results are appended at the bottom of this file after each run.
 
@@ -119,6 +120,31 @@ pair in a network namespace (also C++ interop across it).
 * IPv6 e2e (`-l [::1]:4096`) — needs `ip6tables` in the container; not needed for now.
 * The fifo only supports `reconnect` (same as the C++).
 * Logging goes to stdout with the C++ format; `--log-position` prints file:line.
+
+## Deployment (Pi 4 client, 2026-08-28)
+
+Convention: hash-named binaries in `/opt` (`udp2raw-rust-<short hash>-arm64`, built by
+`cargo build --release` in the arm64 dev container from a clean checkout), the systemd unit
+`/etc/systemd/system/udp2raw-wutong.service` points at one of them
+(`ExecStart=/opt/udp2raw-rust-<hash>-arm64 --conf-file /etc/udp2raw/wutong.conf --threads 2`);
+the conf does not name `--syscalls`/`--aes-backend`, so `auto` applies (single + table on
+this CPU, logged at level 4 — the conf runs at level 3, so verify with a tracepoint sample
+or a smoke run instead). Procedure used:
+
+1. `--unit-test` on the box, then a smoke run as a *second* client against the real server
+   with a copy of the conf on another `-l` port (7001 was taken by an unrelated listener;
+   `ss -lun` first) and `--log-level 4`: `client_ready` within a second, iptables rule removed
+   on exit. Delete the copy afterwards (it holds the key).
+2. Back up the unit, `sed` the `ExecStart` path, `daemon-reload`, `restart`; wait for the
+   wg1 handshake (8 s), `ping 10.66.0.1` (0 % loss at 12 ms), check the journal.
+   Rollback = restore the backup unit (`/root/bench/udp2raw-wutong.service.bak-60a36d6`),
+   `daemon-reload`, `restart`; the previous binary stays in `/opt`.
+3. Live check of the syscall mode: tracefs `raw_syscalls` on the main PID for 2 s showed
+   only `sendto`/`recvfrom`/`epoll_pwait`/`read`/`futex` — no mmsg calls.
+
+Known, pre-existing: the client logs `WARN unexpected adress <ip> <server ip> <port>
+<server port>` (~50/day) when a foreign TCP packet reaches its raw socket — ignored
+packets, same message as the C++.
 
 ## Wire-format reference (for debugging)
 
