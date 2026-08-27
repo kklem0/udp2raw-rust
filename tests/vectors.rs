@@ -4,7 +4,7 @@
 //! against the unmodified udp2raw C++ sources (see `tools/cpp_harness/`). Every cipher ×
 //! auth mode × role combination is covered.
 
-use udp2raw::crypto::{AuthMode, CipherMode, Crypto, Keys};
+use udp2raw::crypto::{AesBackend, AuthMode, CipherMode, Crypto, Keys};
 use udp2raw::util::{hex, unhex};
 
 fn hex_or_dash(v: &[u8]) -> String {
@@ -17,16 +17,31 @@ struct Cfg {
     auth: AuthMode,
     password: String,
     cfb_legacy: bool,
+    backend: AesBackend,
 }
 
 impl Cfg {
     fn crypto(&self, client: bool) -> Crypto {
-        Crypto::new(self.cipher, self.auth, self.cfb_legacy, Keys::derive(&self.password, client))
+        Crypto::with_backend(self.cipher, self.auth, self.cfb_legacy, Keys::derive(&self.password, client), self.backend)
     }
 }
 
 #[test]
-fn golden_vectors_from_cpp() {
+fn golden_vectors_from_cpp_auto_backend() {
+    golden_vectors(AesBackend::Auto);
+}
+
+#[test]
+fn golden_vectors_from_cpp_table_backend() {
+    golden_vectors(AesBackend::Table);
+}
+
+#[test]
+fn golden_vectors_from_cpp_fixslice_backend() {
+    golden_vectors(AesBackend::Fixslice);
+}
+
+fn golden_vectors(backend: AesBackend) {
     let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/vectors.txt"))
         .expect("tests/data/vectors.txt missing — run tools/gen_vectors.py");
     let mut cfg: Option<Cfg> = None;
@@ -45,6 +60,7 @@ fn golden_vectors_from_cpp() {
                     auth: AuthMode::parse(f[3]).unwrap(),
                     password: String::from_utf8(unhex(f[4]).unwrap()).unwrap(),
                     cfb_legacy: legacy_from_name || f[5] == "1",
+                    backend,
                 };
                 me = Some(c.crypto(c.role_client));
                 other = Some(c.crypto(!c.role_client));

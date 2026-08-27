@@ -7,12 +7,13 @@
 //! [`Crypto`] is immutable after construction and `Send + Sync`, so worker threads can
 //! share one instance behind an `Arc`.
 
+pub mod aes_table;
 pub mod auth;
 pub mod cipher;
 pub mod kdf;
 
 pub use auth::{AuthMode, Authenticator};
-pub use cipher::{AesKey, CipherMode};
+pub use cipher::{AesBackend, AesKey, CipherMode, cpu_has_aes, resolve_backend};
 
 use crate::consts::MAX_DATA_LEN;
 use cipher::{pad16, unpad16, xor_in_place};
@@ -102,7 +103,12 @@ pub struct Crypto {
 }
 
 impl Crypto {
+    /// Auto-selected AES backend (hardware if the CPU has it, else table-driven).
     pub fn new(cipher_mode: CipherMode, auth_mode: AuthMode, cfb_legacy: bool, keys: Keys) -> Crypto {
+        Self::with_backend(cipher_mode, auth_mode, cfb_legacy, keys, AesBackend::Auto)
+    }
+
+    pub fn with_backend(cipher_mode: CipherMode, auth_mode: AuthMode, cfb_legacy: bool, keys: Keys, backend: AesBackend) -> Crypto {
         let hmac = auth_mode == AuthMode::HmacSha1;
         let tx_key: [u8; 16] = if hmac {
             keys.cipher_key_encrypt[..16].try_into().unwrap()
@@ -116,10 +122,10 @@ impl Crypto {
         };
         let (tx_aes, rx_aes, ecb_enc, ecb_dec) = if cipher_mode.is_aes() {
             (
-                Some(AesKey::new(&tx_key)),
-                Some(AesKey::new(&rx_key)),
-                Some(AesKey::new(&keys.cipher_key_encrypt[..16])),
-                Some(AesKey::new(&keys.cipher_key_decrypt[..16])),
+                Some(AesKey::with_backend(&tx_key, backend)),
+                Some(AesKey::with_backend(&rx_key, backend)),
+                Some(AesKey::with_backend(&keys.cipher_key_encrypt[..16], backend)),
+                Some(AesKey::with_backend(&keys.cipher_key_decrypt[..16], backend)),
             )
         } else {
             (None, None, None, None)
@@ -153,6 +159,10 @@ impl Crypto {
     }
     pub fn is_hmac_used(&self) -> bool {
         self.auth_mode == AuthMode::HmacSha1
+    }
+    /// The AES backend in use (`None` for non-AES cipher modes).
+    pub fn aes_backend(&self) -> Option<AesBackend> {
+        self.tx_aes.as_ref().map(|k| k.backend())
     }
 
     /// `my_encrypt`: returns the on-the-wire bytes for `data`, or `None` if `data` is too long.
@@ -300,9 +310,11 @@ mod tests {
     fn roundtrip_every_mode_both_directions() {
         let modes = [CipherMode::None, CipherMode::Xor, CipherMode::Aes128Cbc, CipherMode::Aes128Cfb];
         let auths = [AuthMode::None, AuthMode::Md5, AuthMode::Crc32, AuthMode::Simple, AuthMode::HmacSha1];
+        for backend in [AesBackend::Auto, AesBackend::Table, AesBackend::Fixslice] {
         for cm in modes {
             for am in auths {
-                let (c, s) = pair(cm, am);
+                let c = Crypto::with_backend(cm, am, false, Keys::derive("secret key", true), backend);
+                let s = Crypto::with_backend(cm, am, false, Keys::derive("secret key", false), backend);
                 // 1700 leaves room for tag + padding below MAX_DATA_LEN (the C++ rejects
                 // ciphertexts longer than max_data_len on the receive side too).
                 for len in [0usize, 1, 15, 16, 17, 33, 100, 1401, 1700] {
@@ -327,6 +339,7 @@ mod tests {
                 }
                 assert!(c.encrypt(&vec![0u8; 1801]).is_none());
             }
+        }
         }
     }
 

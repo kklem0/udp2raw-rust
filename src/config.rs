@@ -2,7 +2,7 @@
 //! (`process_arg`, `load_config`, `parse_conf_line`); `--threads` is new.
 
 use crate::consts::*;
-use crate::crypto::{AuthMode, CipherMode};
+use crate::crypto::{AesBackend, AuthMode, CipherMode};
 use crate::types::{ProgramMode, RawMode};
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr};
@@ -100,6 +100,9 @@ struct Cli {
     /// Number of crypto worker threads (0 = do everything on the I/O thread).
     #[arg(long)]
     threads: Option<usize>,
+    /// AES implementation: auto (default), hw, table, fixslice.
+    #[arg(long = "aes-backend")]
+    aes_backend: Option<String>,
     #[arg(short = 'h', long)]
     help: bool,
 }
@@ -153,6 +156,7 @@ pub struct Config {
     pub wait_lock: bool,
     pub debug: bool,
     pub threads: usize,
+    pub aes_backend: AesBackend,
 }
 
 impl Config {
@@ -192,6 +196,8 @@ client options:
                                           this option disables port changing while re-connecting
 other options:
     --threads             <number>        crypto worker threads, 0 = single-threaded (default: auto)
+    --aes-backend         <string>        auto(default),hw,table,fixslice. auto = CPU AES instructions
+                                          if present, otherwise table-driven software AES
     --conf-file           <string>        read options from a configuration file instead of command line.
                                           check example.conf in repo for format
     --fifo                <string>        use a fifo(named pipe) for sending commands to the running program,
@@ -404,6 +410,10 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
     if random_drop > 10000 {
         return Err("random_drop must be between 0 10000".into());
     }
+    let aes_backend = match &cli.aes_backend {
+        Some(s) => AesBackend::parse(s).ok_or_else(|| format!("no such aes backend {s}"))?,
+        None => AesBackend::Auto,
+    };
     let log_level = cli.log_level.unwrap_or(4);
     if !(0..=6).contains(&log_level) {
         return Err("invalid log_level".into());
@@ -474,6 +484,7 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         wait_lock: cli.wait_lock,
         debug: cli.debug,
         threads: cli.threads.unwrap_or_else(default_threads),
+        aes_backend,
     };
     Ok(ParseOutcome::Run(Box::new(cfg)))
 }

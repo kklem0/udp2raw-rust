@@ -8,8 +8,70 @@
 //! * `aes128cfb` first ECB-encrypts block 0 with the HKDF-derived `cipher_key_encrypt`
 //!   (unless the legacy `aes128cfb_0` variant is selected), then runs CFB-128.
 
+use super::aes_table::AesTable;
 use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::Aes128;
+
+/// Which AES implementation to use. `Auto` picks the CPU's AES instructions when present
+/// (aarch64 crypto extensions, x86 AES-NI), otherwise the table-driven code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AesBackend {
+    Auto,
+    /// The `aes` crate: hardware instructions if the CPU has them, else its bitsliced code.
+    Hardware,
+    /// Table-driven AES (fast serial CBC on CPUs without AES instructions).
+    Table,
+    /// The `aes` crate's constant-time bitsliced software code, forced (for measurements).
+    Fixslice,
+}
+
+impl AesBackend {
+    pub fn parse(s: &str) -> Option<AesBackend> {
+        match s {
+            "auto" => Some(AesBackend::Auto),
+            "hw" | "hardware" => Some(AesBackend::Hardware),
+            "table" => Some(AesBackend::Table),
+            "fixslice" | "soft" => Some(AesBackend::Fixslice),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AesBackend::Auto => "auto",
+            AesBackend::Hardware => "hardware",
+            AesBackend::Table => "table",
+            AesBackend::Fixslice => "fixslice",
+        }
+    }
+}
+
+/// True when the CPU executes AES in hardware (so the `aes` crate will use it).
+pub fn cpu_has_aes() -> bool {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"))]
+    {
+        cpufeatures::new!(cpuid_aes, "aes");
+        cpuid_aes::get()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86")))]
+    {
+        false
+    }
+}
+
+/// The backend `Auto` resolves to on this machine.
+pub fn resolve_backend(b: AesBackend) -> AesBackend {
+    match b {
+        AesBackend::Auto => {
+            if cpu_has_aes() {
+                AesBackend::Hardware
+            } else {
+                AesBackend::Table
+            }
+        }
+        other => other,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CipherMode {
@@ -50,28 +112,59 @@ pub type Block = [u8; 16];
 
 /// One AES-128 key schedule (both directions of the block cipher).
 #[derive(Clone)]
-pub struct AesKey {
-    cipher: Aes128,
+pub enum AesKey {
+    Crate(Aes128),
+    Table(AesTable),
 }
 
 impl AesKey {
+    /// Auto-selected backend.
     pub fn new(key16: &[u8]) -> Self {
-        let cipher = Aes128::new_from_slice(&key16[..16]).expect("aes key length");
-        AesKey { cipher }
+        Self::with_backend(key16, AesBackend::Auto)
+    }
+
+    pub fn with_backend(key16: &[u8], backend: AesBackend) -> Self {
+        match resolve_backend(backend) {
+            AesBackend::Table => AesKey::Table(AesTable::new(&key16[..16])),
+            _ => AesKey::Crate(Aes128::new_from_slice(&key16[..16]).expect("aes key length")),
+        }
+    }
+
+    pub fn backend(&self) -> AesBackend {
+        match self {
+            AesKey::Crate(_) => {
+                if cpu_has_aes() {
+                    AesBackend::Hardware
+                } else {
+                    AesBackend::Fixslice
+                }
+            }
+            AesKey::Table(_) => AesBackend::Table,
+        }
     }
 
     #[inline]
     pub fn encrypt_block(&self, block: &mut Block) {
-        let mut b = Array::from(*block);
-        self.cipher.encrypt_block(&mut b);
-        block.copy_from_slice(&b);
+        match self {
+            AesKey::Crate(c) => {
+                let mut b = Array::from(*block);
+                c.encrypt_block(&mut b);
+                block.copy_from_slice(&b);
+            }
+            AesKey::Table(t) => t.encrypt_block(block),
+        }
     }
 
     #[inline]
     pub fn decrypt_block(&self, block: &mut Block) {
-        let mut b = Array::from(*block);
-        self.cipher.decrypt_block(&mut b);
-        block.copy_from_slice(&b);
+        match self {
+            AesKey::Crate(c) => {
+                let mut b = Array::from(*block);
+                c.decrypt_block(&mut b);
+                block.copy_from_slice(&b);
+            }
+            AesKey::Table(t) => t.decrypt_block(block),
+        }
     }
 
     /// CBC encrypt in place with a zero IV. `data.len()` must be a multiple of 16.
@@ -92,24 +185,40 @@ impl AesKey {
     /// CBC decrypt in place with a zero IV. `data.len()` must be a multiple of 16.
     pub fn cbc_decrypt_zero_iv(&self, data: &mut [u8]) {
         debug_assert!(data.len() % 16 == 0);
-        // Decrypt all blocks first (independent, lets the backend pipeline them), then
-        // XOR each with the previous ciphertext block.
         let n = data.len() / 16;
         if n == 0 {
             return;
         }
-        let mut blocks: Vec<Array<u8, aes::cipher::consts::U16>> = data
-            .chunks_exact(16)
-            .map(|c| Array::from(<Block>::try_from(c).unwrap()))
-            .collect();
-        self.cipher.decrypt_blocks(&mut blocks);
-        let mut prev = [0u8; 16];
-        for (i, chunk) in data.chunks_exact_mut(16).enumerate() {
-            let ct: Block = chunk.try_into().unwrap();
-            for j in 0..16 {
-                chunk[j] = blocks[i][j] ^ prev[j];
+        match self {
+            AesKey::Crate(c) => {
+                // Decrypt all blocks first (independent, lets the backend pipeline them),
+                // then XOR each with the previous ciphertext block.
+                let mut blocks: Vec<Array<u8, aes::cipher::consts::U16>> = data
+                    .chunks_exact(16)
+                    .map(|ch| Array::from(<Block>::try_from(ch).unwrap()))
+                    .collect();
+                c.decrypt_blocks(&mut blocks);
+                let mut prev = [0u8; 16];
+                for (i, chunk) in data.chunks_exact_mut(16).enumerate() {
+                    let ct: Block = chunk.try_into().unwrap();
+                    for j in 0..16 {
+                        chunk[j] = blocks[i][j] ^ prev[j];
+                    }
+                    prev = ct;
+                }
             }
-            prev = ct;
+            AesKey::Table(t) => {
+                let mut prev = [0u8; 16];
+                for chunk in data.chunks_exact_mut(16) {
+                    let ct: Block = chunk.try_into().unwrap();
+                    let mut b = ct;
+                    t.decrypt_block(&mut b);
+                    for j in 0..16 {
+                        chunk[j] = b[j] ^ prev[j];
+                    }
+                    prev = ct;
+                }
+            }
         }
     }
 
@@ -193,27 +302,54 @@ mod tests {
         assert_eq!(hex(&b), "6bc1bee22e409f96e93d7e117393172a");
     }
 
+    fn all_backends() -> Vec<AesKey> {
+        let key = unhex(KEY).unwrap();
+        vec![AesKey::with_backend(&key, AesBackend::Hardware), AesKey::with_backend(&key, AesBackend::Table), AesKey::with_backend(&key, AesBackend::Fixslice)]
+    }
+
     #[test]
     fn cbc_zero_iv_roundtrip_and_first_block() {
-        let k = AesKey::new(&unhex(KEY).unwrap());
-        let mut d = unhex(PT).unwrap();
-        k.cbc_encrypt_zero_iv(&mut d);
-        // with IV = 0 the first block equals ECB(pt0)
-        assert_eq!(hex(&d[..16]), "3ad77bb40d7a3660a89ecaf32466ef97");
-        k.cbc_decrypt_zero_iv(&mut d);
-        assert_eq!(hex(&d), PT);
+        for k in all_backends() {
+            let mut d = unhex(PT).unwrap();
+            k.cbc_encrypt_zero_iv(&mut d);
+            // with IV = 0 the first block equals ECB(pt0)
+            assert_eq!(hex(&d[..16]), "3ad77bb40d7a3660a89ecaf32466ef97", "{:?}", k.backend());
+            // SP 800-38A F.2.1 second block with a zero IV differs; check the full CBC roundtrip
+            k.cbc_decrypt_zero_iv(&mut d);
+            assert_eq!(hex(&d), PT, "{:?}", k.backend());
+        }
+    }
+
+    #[test]
+    fn backends_agree_on_cbc_and_cfb() {
+        let mut data = vec![0u8; 1424];
+        crate::util::secure_random_bytes(&mut data);
+        let ks = all_backends();
+        let mut outs = Vec::new();
+        for k in &ks {
+            let mut d = data.clone();
+            k.cbc_encrypt_zero_iv(&mut d);
+            let mut e = data[..1001].to_vec();
+            k.cfb_encrypt_zero_iv(&mut e);
+            outs.push((d, e));
+        }
+        for o in &outs[1..] {
+            assert_eq!(o.0, outs[0].0, "cbc backends differ");
+            assert_eq!(o.1, outs[0].1, "cfb backends differ");
+        }
     }
 
     #[test]
     fn cfb_zero_iv_roundtrip() {
-        let k = AesKey::new(&unhex(KEY).unwrap());
-        let mut d = unhex(PT).unwrap();
-        d.push(0x42); // partial block
-        let orig = d.clone();
-        k.cfb_encrypt_zero_iv(&mut d);
-        assert_ne!(d, orig);
-        k.cfb_decrypt_zero_iv(&mut d);
-        assert_eq!(d, orig);
+        for k in all_backends() {
+            let mut d = unhex(PT).unwrap();
+            d.push(0x42); // partial block
+            let orig = d.clone();
+            k.cfb_encrypt_zero_iv(&mut d);
+            assert_ne!(d, orig);
+            k.cfb_decrypt_zero_iv(&mut d);
+            assert_eq!(d, orig);
+        }
     }
 
     #[test]

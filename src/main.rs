@@ -91,7 +91,10 @@ mod linux {
 
         let keys = Keys::derive(&cfg.key, cfg.is_client());
         log::debug!("normal_key={} cipher_key_encrypt={} cipher_key_decrypt={}", hex(&keys.normal_key), hex(&keys.cipher_key_encrypt), hex(&keys.cipher_key_decrypt));
-        let crypto = Arc::new(Crypto::new(cfg.cipher_mode, cfg.auth_mode, cfg.cfb_legacy, keys));
+        let crypto = Arc::new(Crypto::with_backend(cfg.cipher_mode, cfg.auth_mode, cfg.cfb_legacy, keys, cfg.aes_backend));
+        if let Some(b) = crypto.aes_backend() {
+            log::info!("aes backend: {} (cpu aes instructions: {})", b.name(), udp2raw::crypto::cpu_has_aes());
+        }
 
         if cfg.clear_rules {
             iptables::clear_all(&cfg);

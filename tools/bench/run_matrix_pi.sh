@@ -8,7 +8,7 @@
 # duration, restoring both afterwards; waits for the SoC to cool between runs.
 set -uo pipefail
 SECS=${1:-10}; MAXPPS=${2:-150000}
-CPP=./udp2raw-cpp; RUST=./udp2raw-rust
+CPP=${CPP:-./udp2raw-cpp}; RUST=${RUST:-./udp2raw-rust}
 export BENCH=./udpbench PROBE=./udp_probe.py LOGDIR=${LOGDIR:-$PWD/logs}
 mkdir -p "$LOGDIR"
 
