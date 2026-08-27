@@ -27,7 +27,12 @@ sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 >/dev/null 2>&1 
 export BENCH=./udpbench PROBE=./udp_probe.py LOGDIR=$B/logs
 echo "# $(date -Is) docker nproc=$(nproc) cpuset=$CPUSET hi=$HI secs=$SECS"
 echo "# cpp=$(./udp2raw-cpp -h 2>&1 | sed -n 2p | tr -s ' ') rust=$(git -C /work rev-parse --short HEAD 2>/dev/null)"
-run() { taskset -c "$CPUSET" ./bench_ndr.sh "$1" "$2" "$3" "$4" "$5" "$6" 1300 "$HI" "$SECS" 2>&1 | grep -E "^NDR"; sleep 1; }
+run() {
+    local out
+    out=$(taskset -c "$CPUSET" bash ./bench_ndr.sh "$1" "$2" "$3" "$4" "$5" "$6" 1300 "$HI" "$SECS" 2>&1)
+    if ! printf '%s\n' "$out" | grep -E "^NDR"; then echo "case $1 produced no result:"; printf '%s\n' "$out" | tail -5; fi
+    sleep 1
+}
 PROD="--log-level 4 --fix-gro"
 T="--aes-backend table"    # the code path of a CPU without AES instructions (Raspberry Pi 4)
 run cpp_cpp                 ./udp2raw-cpp  ./udp2raw-cpp  "$PROD" "" ""
