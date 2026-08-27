@@ -93,6 +93,7 @@ fi
 run_case rust_rust_default          "$RUST" "$RUST" "$D" "" ""
 run_case rust_rust_threads0         "$RUST" "$RUST" "$D" "--threads 0" "--threads 0"
 run_case rust_rust_threads3         "$RUST" "$RUST" "$D" "--threads 3" "--threads 3"
+run_case rust_rust_table_aes        "$RUST" "$RUST" "$D --aes-backend table" "" ""
 run_case rust_rust_cfb_hmac_gro     "$RUST" "$RUST" "$D --cipher-mode aes128cfb --auth-mode hmac_sha1 --fix-gro" "" ""
 run_case rust_rust_xor_simple_seq1  "$RUST" "$RUST" "$D --cipher-mode xor --auth-mode simple --seq-mode 1" "" ""
 run_case rust_rust_none_none        "$RUST" "$RUST" "$D --cipher-mode none --auth-mode none" "" ""

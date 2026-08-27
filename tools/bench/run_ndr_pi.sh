@@ -17,7 +17,7 @@ trap restore EXIT
 sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 >/dev/null
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$g" 2>/dev/null; done
 temp_c() { awk '{printf "%d", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0; }
-cool_down() { for _ in $(seq 1 60); do [ "$(temp_c)" -lt 66 ] && return; sleep 5; done; }
+cool_down() { for _ in $(seq 1 60); do [ "$(temp_c)" -lt 72 ] && return; sleep 5; done; }
 echo "# $(date -Is) host=$(hostname) kernel=$(uname -r) ncpu=$(nproc) max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) no-drop-rate search hi=$HI secs=$SECS max_loss=${MAX_LOSS:-0.02}"
 run() { cool_down; ./bench_ndr.sh "$1" "$2" "$3" "$4" "$5" "$6" "${7:-1300}" "$HI" "$SECS" 2>&1; sleep 2; }
 PROD="--log-level 4 --fix-gro"

@@ -14,8 +14,10 @@ What is different from the C++ version:
   `--threads 0` gives the old single-threaded behaviour.
 * **Hardware crypto without special builds.** AES uses the ARMv8 Cryptography Extensions
   (Raspberry Pi 5, most ARM servers) or AES-NI when the CPU has them, detected at runtime;
-  SHA-1/SHA-2 likewise. The Pi 4 (Cortex-A72, no crypto extensions) falls back to a
-  constant-time software AES.
+  SHA-1/SHA-2 likewise. CPUs without AES instructions (Raspberry Pi 4, Cortex-A72) get a
+  table-driven AES like the C++ version's — the `aes` crate's constant-time bitsliced
+  fallback is 2–4× slower for udp2raw's serial CBC encryption. `--aes-backend
+  auto|hw|table|fixslice` overrides the choice.
 * **Linux only.** Windows/macOS (the `udp2raw-multiplatform` pcap build) is not ported.
 * No per-packet `/dev/urandom` reads, no per-packet heap churn in the hot path, and the
   code is memory-safe — it runs as root / with `CAP_NET_RAW` and parses untrusted packets.
