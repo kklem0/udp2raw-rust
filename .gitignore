@@ -1,0 +1,4 @@
+/target
+/target-linux
+/tools/cpp_harness/build
+*.o
