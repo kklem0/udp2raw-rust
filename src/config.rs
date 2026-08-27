@@ -205,8 +205,9 @@ other options:
                                           if present, otherwise table-driven software AES
     --syscalls            <string>        auto(default),mmsg,single. mmsg = recvmmsg/sendmmsg per batch,
                                           single = recvfrom/sendto per packet. auto = single on ARMv8.0
-                                          CPUs (Cortex-A53/A72: no hardware PAN, so every user-memory
-                                          access in a syscall is expensive), mmsg otherwise
+                                          CPUs (Cortex-A53/A72: no hardware PAN, so the kernel's software
+                                          PAN makes every user-memory access in a syscall expensive)
+                                          unless the kernel config says software PAN is off, mmsg otherwise
     --conf-file           <string>        read options from a configuration file instead of command line.
                                           check example.conf in repo for format
     --fifo                <string>        use a fifo(named pipe) for sending commands to the running program,
