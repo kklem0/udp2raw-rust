@@ -2,7 +2,7 @@
 //! `IPPROTO_RAW` (or `AF_PACKET` when `--lower-level`) sender — `init_raw_socket`,
 //! `init_filter`, `send_raw_packet`, `pre_recv_raw_packet`.
 
-use super::addr::{if_nametoindex, set_nonblocking, setsockopt_int, to_sockaddr};
+use super::addr::{bind_to_device, if_nametoindex, set_nonblocking, setsockopt_int, to_sockaddr};
 use super::bpf;
 use crate::config::Config;
 use crate::types::RawMode;
@@ -47,8 +47,18 @@ impl RawSockets {
             .map_err(|e| io::Error::new(e.kind(), format!("SO_RCVBUF fail socket_buf_size={} errno={}", cfg.socket_buf_size, e)))?;
 
         let s = RawSockets { send_fd, recv_fd, is_v6, lower_level };
-        if let Some(dev) = &cfg.dev {
-            s.bind_dev(dev)?;
+        // --underlay-dev: the sender's route lookups stay on the native interface, and the
+        // receiver filters only that interface unless --dev says otherwise
+        if let Some(dev) = &cfg.underlay_dev {
+            if !lower_level {
+                bind_to_device(send_fd, dev).map_err(|e| io::Error::new(e.kind(), format!("bind raw sender to underlay [{dev}] failed: {e}")))?;
+                log::info!("raw sender bound to underlay device {dev}");
+            }
+        }
+        match (&cfg.dev, &cfg.underlay_dev) {
+            (Some(dev), _) => s.bind_dev(dev)?,
+            (None, Some(dev)) => s.bind_dev(dev)?,
+            (None, None) => {}
         }
         set_nonblocking(send_fd)?;
         set_nonblocking(recv_fd)?;

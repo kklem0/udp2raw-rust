@@ -7,7 +7,10 @@ use crate::consts::*;
 use crate::conv::ConvManager;
 use crate::crypto::Crypto;
 use crate::faketcp::{RawCtx, RecvMeta};
+use crate::endpoint::{CycleReason, EndpointController, Switch};
 use crate::fifo;
+use crate::iptables::{self, Iptables};
+use crate::net::route;
 use crate::net::{self, addr, raw::RawSockets, send_batch, RecvBatch, SendScratch, TxDst, TxPacket};
 use crate::pipeline::{Done, Job, JobKey, Pipeline};
 use crate::types::RawMode;
@@ -37,6 +40,57 @@ enum State {
     Ready,
 }
 
+/// The native interface for relay traffic (`--underlay-dev`) and what a host route through
+/// it needs.
+struct Underlay {
+    dev: String,
+    ifindex: u32,
+    gateway: Option<std::net::Ipv4Addr>,
+    prefsrc: Option<std::net::Ipv4Addr>,
+}
+
+impl Underlay {
+    fn detect(dev: &str, gateway: Option<std::net::Ipv4Addr>, remote: SocketAddr) -> io::Result<Underlay> {
+        let ifindex = addr::if_nametoindex(dev).map_err(|e| io::Error::new(e.kind(), format!("--underlay-dev {dev}: {e}")))? as u32;
+        let mut u = Underlay { dev: dev.to_string(), ifindex, gateway, prefsrc: None };
+        if let IpAddr::V4(v4) = remote.ip() {
+            // learn the next hop from the route the box already has for the bootstrap address
+            let learned = match route::get_route(v4, Some(ifindex)) {
+                Ok(r) => Some(r),
+                Err(e) => match route::get_route(v4, None) {
+                    Ok(r) if r.oif == Some(ifindex) => Some(r),
+                    Ok(r) => {
+                        log::warn!("underlay {dev}: the route to {v4} uses ifindex {:?}, not {ifindex} ({e})", r.oif);
+                        None
+                    }
+                    Err(e2) => {
+                        log::warn!("underlay {dev}: no route to {v4} via {dev} ({e}) nor otherwise ({e2})");
+                        None
+                    }
+                },
+            };
+            if let Some(r) = learned {
+                if u.gateway.is_none() {
+                    u.gateway = r.gateway;
+                }
+                u.prefsrc = r.prefsrc;
+            }
+        }
+        if u.gateway.is_none() {
+            log::warn!("underlay {dev}: no gateway known, relay host routes will be on-link (set --underlay-gateway if the relay is not on this link)");
+        }
+        log::info!("underlay: dev {dev} ifindex {ifindex} gateway {} prefsrc {}", u.gateway.map_or("none".to_string(), |g| g.to_string()), u.prefsrc.map_or("auto".to_string(), |p| p.to_string()));
+        Ok(u)
+    }
+}
+
+/// Kernel state this process installed for one relay address.
+struct Installed {
+    addr: SocketAddr,
+    route: bool,
+    rule: Option<String>,
+}
+
 struct Client {
     cfg: Config,
     crypto: Arc<Crypto>,
@@ -58,6 +112,14 @@ struct Client {
     udp_scratch: SendScratch,
     pool: BufPool,
     hb_buf: Vec<u8>,
+    /// The relay address in use; a hostname `-r` may change it at a reconnect boundary.
+    remote: SocketAddr,
+    endpoint: EndpointController,
+    ipt: Option<Arc<Iptables>>,
+    underlay: Option<Underlay>,
+    installed: Vec<Installed>,
+    /// Why the next attempt from `Idle` starts (set wherever `go_idle` is called).
+    cycle_reason: CycleReason,
     exit_flag: &'static AtomicBool,
     /// Edge-triggered sources that still had data when the per-round budget ran out.
     udp_pending: bool,
@@ -70,7 +132,12 @@ const DRAIN_BUDGET: usize = 64;
 /// Datagrams per `recvmmsg`.
 const RX_BATCH: usize = 32;
 
-pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static AtomicBool) -> io::Result<()> {
+pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static AtomicBool, endpoint: EndpointController, ipt: Option<Arc<Iptables>>) -> io::Result<()> {
+    let remote = endpoint.current();
+    let underlay = match &cfg.underlay_dev {
+        Some(dev) => Some(Underlay::detect(dev, cfg.underlay_gateway, remote)?),
+        None => None,
+    };
     let sockets = RawSockets::open(&cfg)?;
     let ctx = RawCtx::new(&cfg, sockets);
     let raw_mode = cfg.raw_mode;
@@ -86,7 +153,7 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
                 (if_name.clone(), *dest_mac)
             }
             LowerLevel::Auto => {
-                let IpAddr::V4(remote_v4) = cfg.remote_addr.ip() else {
+                let IpAddr::V4(remote_v4) = remote.ip() else {
                     return Err(io::Error::new(io::ErrorKind::Unsupported, "--lower-level auto only supports ipv4"));
                 };
                 let (dest_ip, if_name, mac) = loop {
@@ -109,8 +176,8 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
         info.raw.send_info.addr_ll = net::raw::make_sockaddr_ll(idx, &mac);
     }
 
-    info.raw.send_info.dst_ip = cfg.remote_addr.ip();
-    info.raw.send_info.dst_port = cfg.remote_addr.port();
+    info.raw.send_info.dst_ip = remote.ip();
+    info.raw.send_info.dst_port = remote.port();
 
     let udp = net::bind_udp_listener(cfg.local_addr, cfg.socket_buf_size, cfg.force_socket_buf).map_err(|e| io::Error::new(e.kind(), format!("socket bind error: {e}")))?;
     let pipeline = Pipeline::new(cfg.threads, crypto.clone(), cfg.fix_gro)?;
@@ -136,11 +203,20 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
         udp_scratch: SendScratch::default(),
         pool: BufPool::new(2048, 2048),
         hb_buf,
+        remote,
+        endpoint,
+        ipt,
+        underlay,
+        installed: Vec::new(),
+        cycle_reason: CycleReason::Startup,
         exit_flag,
         udp_pending: false,
         raw_pending: false,
     };
-    c.event_loop()
+    c.record_initial_endpoint();
+    let r = c.event_loop();
+    c.release_all();
+    r
 }
 
 fn fmt_mac(m: &[u8; 6]) -> String {
@@ -243,7 +319,8 @@ impl Client {
         JobKey { slot: 0, generation: self.generation }
     }
 
-    fn go_idle(&mut self, why: &str) {
+    fn go_idle(&mut self, reason: CycleReason, why: &str) {
+        self.cycle_reason = reason;
         self.state = State::Idle;
         self.info.my_id = secure_random_u32_nz();
         self.generation += 1;
@@ -489,6 +566,7 @@ impl Client {
             log::info!("changed state from to client_handshake2 to client_ready");
             self.state = State::Ready;
             self.info.last_hb_sent_time = 0;
+            self.on_endpoint_authenticated();
             self.info.last_hb_recv_time = now_ms();
             self.info.last_oppsite_roller_time = self.info.last_hb_recv_time;
             self.on_timer();
@@ -535,7 +613,7 @@ impl Client {
         log::trace!("timer! roller my {},oppsite {},{}", self.info.my_roller, self.info.oppsite_roller, self.info.last_oppsite_roller_time);
 
         if self.info.raw.disabled {
-            self.go_idle("");
+            self.go_idle(CycleReason::AttemptFailed, "");
         }
         if self.state == State::Idle {
             self.info.raw.rst_received = 0;
@@ -545,9 +623,15 @@ impl Client {
             self.info.my_id = secure_random_u32_nz();
             self.generation += 1;
 
+            // a hostname -r: re-resolve when due and adopt a new relay address before the attempt
+            let reason = std::mem::replace(&mut self.cycle_reason, CycleReason::AttemptFailed);
+            if let Some(sw) = self.endpoint.on_cycle(now, reason) {
+                self.apply_switch(&sw);
+            }
+
             let src_ip = match self.cfg.source_ip {
                 Some(ip) => ip,
-                None => match addr::get_src_addr(self.cfg.remote_addr) {
+                None => match addr::get_src_addr_dev(self.remote, self.underlay.as_ref().map(|u| u.dev.as_str())) {
                     Ok(ip) => {
                         log::info!("source_addr is now {ip}");
                         ip
@@ -592,9 +676,9 @@ impl Client {
                     if self.cfg.easy_faketcp {
                         if let Some(fd) = self.bind_fd {
                             let _ = addr::set_nonblocking(fd);
-                            let (sa, len) = addr::to_sockaddr(self.cfg.remote_addr);
+                            let (sa, len) = addr::to_sockaddr(self.remote);
                             let ret = unsafe { libc::connect(fd, &sa as *const _ as *const libc::sockaddr, len) };
-                            log::debug!("ret={ret},errno={}, {fd} {}", io::Error::last_os_error(), self.cfg.remote_addr);
+                            log::debug!("ret={ret},errno={}, {fd} {}", io::Error::last_os_error(), self.remote);
                         }
                         self.state = State::TcpHandshakeDummy;
                         log::info!("state changed from client_idle to client_tcp_handshake_dummy");
@@ -612,7 +696,7 @@ impl Client {
             State::Idle => {}
             State::TcpHandshake => {
                 if now - self.info.last_state_time > CLIENT_HANDSHAKE_TIMEOUT_MS {
-                    self.go_idle(" from client_tcp_handshake");
+                    self.go_idle(CycleReason::AttemptFailed, " from client_tcp_handshake");
                 } else if now - self.info.last_hb_sent_time > CLIENT_RETRY_INTERVAL_MS {
                     if self.info.last_hb_sent_time == 0 {
                         let s = &mut self.info.raw.send_info;
@@ -630,12 +714,12 @@ impl Client {
             }
             State::TcpHandshakeDummy => {
                 if now - self.info.last_state_time > CLIENT_HANDSHAKE_TIMEOUT_MS {
-                    self.go_idle(" from client_tcp_handshake_dummy");
+                    self.go_idle(CycleReason::AttemptFailed, " from client_tcp_handshake_dummy");
                 }
             }
             State::Handshake1 => {
                 if now - self.info.last_state_time > CLIENT_HANDSHAKE_TIMEOUT_MS {
-                    self.go_idle(" from client_handshake1");
+                    self.go_idle(CycleReason::AttemptFailed, " from client_handshake1");
                 } else if now - self.info.last_hb_sent_time > CLIENT_RETRY_INTERVAL_MS {
                     if self.cfg.raw_mode == RawMode::FakeTcp {
                         if self.info.last_hb_sent_time == 0 {
@@ -669,7 +753,7 @@ impl Client {
             }
             State::Handshake2 => {
                 if now - self.info.last_state_time > CLIENT_HANDSHAKE_TIMEOUT_MS {
-                    self.go_idle(" from client_handshake2");
+                    self.go_idle(CycleReason::AttemptFailed, " from client_handshake2");
                 } else if now - self.info.last_hb_sent_time > CLIENT_RETRY_INTERVAL_MS {
                     if self.cfg.raw_mode == RawMode::FakeTcp {
                         if self.info.last_hb_sent_time == 0 {
@@ -696,11 +780,11 @@ impl Client {
             State::Ready => {
                 self.fail_time_counter = 0;
                 if now - self.info.last_hb_recv_time > CLIENT_CONN_TIMEOUT_MS {
-                    self.go_idle(" from  client_ready bc of server-->client direction timeout");
+                    self.go_idle(CycleReason::SessionLost, " from  client_ready bc of server-->client direction timeout");
                     return;
                 }
                 if now - self.info.last_oppsite_roller_time > CLIENT_CONN_UPLINK_TIMEOUT_MS {
-                    self.go_idle(" from  client_ready bc of client-->server direction timeout");
+                    self.go_idle(CycleReason::SessionLost, " from  client_ready bc of client-->server direction timeout");
                     return;
                 }
                 if now - self.info.last_hb_sent_time < HEARTBEAT_INTERVAL_MS {
@@ -717,12 +801,134 @@ impl Client {
         }
     }
 
+    // ---------------------------------------------------------------- relay endpoint (hostname -r)
+
+    fn pattern_for(&self, addr: SocketAddr) -> String {
+        iptables::pattern_for(&self.cfg, addr)
+    }
+
+    /// Kernel state for the address we start with: its `-a` rule came from `Iptables::init`,
+    /// its host route (with `--underlay-dev`) is installed here.
+    fn record_initial_endpoint(&mut self) {
+        let addr = self.remote;
+        let rule = self.ipt.as_ref().map(|_| self.pattern_for(addr));
+        let route = self.install_route(addr);
+        self.installed.push(Installed { addr, route, rule });
+    }
+
+    fn install_route(&self, addr: SocketAddr) -> bool {
+        let (Some(u), IpAddr::V4(v4)) = (&self.underlay, addr.ip()) else { return false };
+        match route::replace_host_route(v4, u.gateway, u.ifindex, u.prefsrc) {
+            Ok(()) => {
+                log::info!("route: {v4}/32 {}dev {} metric {} proto {}", u.gateway.map_or(String::new(), |g| format!("via {g} ")), u.dev, route::ROUTE_METRIC, route::RTPROT_UDP2RAW);
+                true
+            }
+            Err(e) => {
+                log::warn!("route: could not install {v4}/32 {}dev {}: {e}", u.gateway.map_or(String::new(), |g| format!("via {g} ")), u.dev);
+                false
+            }
+        }
+    }
+
+    /// Rule and route for `addr`, installed before the first packet goes there.
+    fn ensure_installed(&mut self, addr: SocketAddr) {
+        if self.installed.iter().any(|i| i.addr == addr) {
+            return;
+        }
+        let rule = match &self.ipt {
+            Some(ipt) => {
+                let p = self.pattern_for(addr);
+                match ipt.add_pattern(&p) {
+                    Ok(()) => Some(p),
+                    Err(e) => {
+                        log::warn!("{e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let route = self.install_route(addr);
+        self.installed.push(Installed { addr, route, rule });
+    }
+
+    fn release(&mut self, addr: SocketAddr) {
+        let Some(pos) = self.installed.iter().position(|i| i.addr == addr) else { return };
+        let ent = self.installed.remove(pos);
+        if let (Some(ipt), Some(p)) = (&self.ipt, &ent.rule) {
+            ipt.del_pattern(p);
+        }
+        if ent.route {
+            if let (Some(u), IpAddr::V4(v4)) = (&self.underlay, addr.ip()) {
+                match route::delete_host_route(v4, u.ifindex) {
+                    Ok(()) => log::info!("route: removed {v4}/32 dev {}", u.dev),
+                    Err(e) => log::warn!("route: could not remove {v4}/32 dev {}: {e}", u.dev),
+                }
+            }
+        }
+    }
+
+    /// Drop the kernel state of every address not in `keep`.
+    fn release_except(&mut self, keep: &[SocketAddr]) {
+        let stale: Vec<SocketAddr> = self.installed.iter().map(|i| i.addr).filter(|a| !keep.contains(a)).collect();
+        for a in stale {
+            self.release(a);
+        }
+    }
+
+    fn release_all(&mut self) {
+        self.release_except(&[]);
+    }
+
+    /// Switch the relay address at a reconnect boundary: roll back a candidate that never
+    /// authenticated, keep the last-known-good address's rule and route until the new one
+    /// authenticates, install the new address's rule and route, then retarget the raw sender.
+    fn apply_switch(&mut self, sw: &Switch) {
+        let port = sw.to.port();
+        let mut keep = vec![sw.to];
+        if let Some(g) = self.endpoint.last_good() {
+            keep.push(SocketAddr::new(IpAddr::V4(g), port));
+        }
+        self.release_except(&keep);
+        self.ensure_installed(sw.to);
+        self.remote = sw.to;
+        self.info.raw.send_info.dst_ip = sw.to.ip();
+        self.info.raw.send_info.dst_port = sw.to.port();
+        if matches!(self.cfg.lower_level, Some(LowerLevel::Auto)) {
+            if let IpAddr::V4(v4) = sw.to.ip() {
+                match net::lower_level::find_lower_level_info(v4) {
+                    Ok((dest_ip, if_name, mac)) => match addr::if_nametoindex(&if_name) {
+                        Ok(idx) => {
+                            self.info.raw.send_info.addr_ll = net::raw::make_sockaddr_ll(idx, &mac);
+                            log::info!("lower-level (auto) now {dest_ip} {if_name} {}", fmt_mac(&mac));
+                        }
+                        Err(e) => log::warn!("lower-level: {if_name}: {e}"),
+                    },
+                    Err(e) => log::warn!("lower-level auto re-detect for {v4} failed: {e}; keeping the previous link-layer destination"),
+                }
+            }
+        }
+        log::warn!("endpoint: relay is now {} (was {}; {})", sw.to, sw.from, sw.why);
+    }
+
+    /// The handshake with the current address succeeded: it becomes last-known-good and the
+    /// kernel state of every other address goes.
+    fn on_endpoint_authenticated(&mut self) {
+        if !self.endpoint.is_dynamic() {
+            return;
+        }
+        let _ = self.endpoint.on_authenticated();
+        let cur = self.remote;
+        self.release_except(&[cur]);
+    }
+
     fn on_fifo(&mut self, fd: RawFd) {
         if let Some(cmd) = fifo::read_command(fd) {
             log::info!("got data from fifo,s=[{cmd}]");
             if cmd == "reconnect" {
                 log::info!("received command: reconnect");
-                self.go_idle(" (fifo reconnect)");
+                self.endpoint.request_refresh("fifo reconnect");
+                self.go_idle(CycleReason::Forced, " (fifo reconnect)");
             } else {
                 log::info!("unknown command");
             }

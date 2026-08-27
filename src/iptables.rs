@@ -7,9 +7,10 @@ use crate::config::Config;
 use crate::consts::IPTABLES_RULE_KEEP_INTERVAL_S;
 use crate::types::RawMode;
 use std::io;
+use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Run `cmd` through `sh -c`. Returns (success, stdout). `show_log` mirrors the C++ flag:
 /// failures are logged at warn level (else debug) and stderr is folded into stdout.
@@ -45,12 +46,18 @@ pub fn base_command(cfg: &Config) -> String {
     c
 }
 
-/// The match part of the DROP rule.
+/// The match part of the DROP rule for the configured remote (client) or listener (server).
 pub fn pattern(cfg: &Config) -> String {
+    pattern_for(cfg, cfg.remote_addr)
+}
+
+/// The match part of the DROP rule; `remote` is the relay address a client talks to (it
+/// changes when a hostname `-r` resolves to a new address).
+pub fn pattern_for(cfg: &Config, remote: SocketAddr) -> String {
     let v6 = cfg.raw_is_v6();
     if cfg.is_client() {
-        let ip = cfg.remote_addr.ip();
-        let port = cfg.remote_addr.port();
+        let ip = remote.ip();
+        let port = remote.port();
         match cfg.raw_mode {
             RawMode::FakeTcp => format!("-s {ip} -p tcp -m tcp --sport {port}"),
             RawMode::Udp => format!("-s {ip} -p udp -m udp --sport {port}"),
@@ -115,13 +122,17 @@ pub fn gen_add(cfg: &Config, pattern: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The `-a` rules of one process: private DROP chain(s) plus one INPUT jump per active
+/// match pattern. A client with a hostname `-r` adds a pattern for a new relay address
+/// before trying it and removes the old one only after the new address authenticated (or
+/// the attempt is rolled back), so the kernel never answers a relay's fake TCP.
 pub struct Iptables {
     cmd: String,
     chains: [String; 2],
-    rule_keep_add: [String; 2],
-    rule_keep_del: [String; 2],
     keep: bool,
     keep_index: AtomicUsize,
+    /// Match patterns currently jumping to the chain, in insertion order.
+    patterns: Mutex<Vec<String>>,
 }
 
 impl Iptables {
@@ -129,26 +140,75 @@ impl Iptables {
     pub fn init(cfg: &Config, pattern: &str, const_id: u32, keep: bool) -> io::Result<Iptables> {
         let cmd = base_command(cfg);
         let chains = [format!("udp2rawDwrW_{const_id:x}_C0"), format!("udp2rawDwrW_{const_id:x}_C1")];
-        let rule_keep = [format!("{pattern} -j {}", chains[0]), format!("{pattern} -j {}", chains[1])];
-        let rule_keep_add = [format!("{cmd}-I INPUT {}", rule_keep[0]), format!("{cmd}-I INPUT {}", rule_keep[1])];
-        let rule_keep_del = [format!("{cmd}-D INPUT {}", rule_keep[0]), format!("{cmd}-D INPUT {}", rule_keep[1])];
-        let it = Iptables { cmd, chains, rule_keep_add, rule_keep_del, keep, keep_index: AtomicUsize::new(0) };
+        let it = Iptables { cmd, chains, keep, keep_index: AtomicUsize::new(0), patterns: Mutex::new(Vec::new()) };
         for i in 0..=(keep as usize) {
             run_command(&format!("{}-N {}", it.cmd, it.chains[i]), true);
             run_command(&format!("{}-F {}", it.cmd, it.chains[i]), true);
             run_command(&format!("{}-I {} -j DROP", it.cmd, it.chains[i]), true);
-            if !run_command(&it.rule_keep_add[i], true).0 {
-                return Err(io::Error::other(format!("auto added iptables failed by: {}", it.rule_keep_add[i])));
+            let add = it.jump_add(i, pattern);
+            if !run_command(&add, true).0 {
+                return Err(io::Error::other(format!("auto added iptables failed by: {add}")));
             }
         }
+        it.patterns.lock().unwrap().push(pattern.to_string());
         log::warn!("auto added iptables rules");
         Ok(it)
     }
 
-    /// `keep_iptables_rule`: re-create the alternate chain and re-insert the jump, so the
-    /// rule survives firewall reloads on boxes without `iptables --check`.
+    fn jump_add(&self, chain: usize, pattern: &str) -> String {
+        format!("{}-I INPUT {pattern} -j {}", self.cmd, self.chains[chain])
+    }
+
+    fn jump_del(&self, chain: usize, pattern: &str) -> String {
+        format!("{}-D INPUT {pattern} -j {}", self.cmd, self.chains[chain])
+    }
+
+    /// The chain the most recent `keep` round (or `init`) pointed INPUT at.
+    fn active_chain(&self) -> usize {
+        if self.keep { self.keep_index.load(Ordering::Relaxed) % 2 } else { 0 }
+    }
+
+    /// Add the INPUT jump for one more match pattern (a new relay address). Idempotent.
+    pub fn add_pattern(&self, pattern: &str) -> io::Result<()> {
+        let mut pats = self.patterns.lock().unwrap();
+        if pats.iter().any(|p| p == pattern) {
+            return Ok(());
+        }
+        let add = self.jump_add(self.active_chain(), pattern);
+        if !run_command(&add, true).0 {
+            return Err(io::Error::other(format!("iptables rule for the new endpoint failed: {add}")));
+        }
+        pats.push(pattern.to_string());
+        log::info!("iptables: added rule [{pattern}]");
+        Ok(())
+    }
+
+    /// Remove the INPUT jumps of one match pattern (from both chains, however many times
+    /// they were added). Unknown patterns are ignored.
+    pub fn del_pattern(&self, pattern: &str) {
+        let mut pats = self.patterns.lock().unwrap();
+        let Some(pos) = pats.iter().position(|p| p == pattern) else { return };
+        pats.remove(pos);
+        for i in 0..2 {
+            let del = self.jump_del(i, pattern);
+            for _ in 0..4 {
+                if !run_command(&del, false).0 {
+                    break;
+                }
+            }
+        }
+        log::info!("iptables: removed rule [{pattern}]");
+    }
+
+    pub fn patterns(&self) -> Vec<String> {
+        self.patterns.lock().unwrap().clone()
+    }
+
+    /// `keep_iptables_rule`: re-create the alternate chain and re-insert the jumps, so the
+    /// rules survive firewall reloads on boxes without `iptables --check`.
     pub fn keep(&self) {
         log::debug!("keep_iptables_rule begin");
+        let pats = self.patterns.lock().unwrap();
         let i = (self.keep_index.fetch_add(1, Ordering::Relaxed) + 1) % 2;
         run_command(&format!("{}-N {}", self.cmd, self.chains[i]), false);
         if !run_command(&format!("{}-F {}", self.cmd, self.chains[i]), false).0 {
@@ -157,20 +217,26 @@ impl Iptables {
         if !run_command(&format!("{}-I {} -j DROP", self.cmd, self.chains[i]), false).0 {
             log::warn!("iptables -I failed {i}");
         }
-        if !run_command(&self.rule_keep_del[i], false).0 {
-            log::warn!("rule_keep_del failed {i}");
-        }
-        run_command(&self.rule_keep_del[i], false); // twice, in case it fails for unknown random reason
-        if !run_command(&self.rule_keep_add[i], true).0 {
-            log::warn!("rule_keep_add failed {i}");
+        for pattern in pats.iter() {
+            let del = self.jump_del(i, pattern);
+            if !run_command(&del, false).0 {
+                log::warn!("rule_keep_del failed {i}");
+            }
+            run_command(&del, false); // twice, in case it fails for unknown random reason
+            if !run_command(&self.jump_add(i, pattern), true).0 {
+                log::warn!("rule_keep_add failed {i}");
+            }
         }
         log::debug!("keep_iptables_rule end");
     }
 
-    /// `clear_iptables_rule`: remove what `init` added (called at exit).
+    /// `clear_iptables_rule`: remove everything `init`/`add_pattern` added (called at exit).
     pub fn clear(&self) {
+        let pats = self.patterns.lock().unwrap();
         for i in 0..=(self.keep as usize) {
-            run_command(&self.rule_keep_del[i], true);
+            for pattern in pats.iter() {
+                run_command(&self.jump_del(i, pattern), true);
+            }
             run_command(&format!("{}-F {}", self.cmd, self.chains[i]), true);
             run_command(&format!("{}-X {}", self.cmd, self.chains[i]), true);
         }
@@ -186,4 +252,29 @@ pub fn spawn_keep_thread(ipt: Arc<Iptables>) {
             ipt.keep();
         })
         .expect("spawn keep-rule thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ParseOutcome, parse_args};
+
+    fn cfg(s: &str) -> Config {
+        let args: Vec<String> = s.split_whitespace().map(String::from).collect();
+        match parse_args(&args).unwrap() {
+            ParseOutcome::Run(c) => *c,
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn client_pattern_follows_the_remote_address() {
+        let c = cfg("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1");
+        assert_eq!(pattern_for(&c, "47.243.1.1:8443".parse().unwrap()), "-s 47.243.1.1 -p tcp -m tcp --sport 8443");
+        assert_eq!(pattern_for(&c, "47.243.2.2:8443".parse().unwrap()), "-s 47.243.2.2 -p tcp -m tcp --sport 8443");
+        let u = cfg("-c -l 127.0.0.1:7000 -r 47.243.1.1:8443 --raw-mode udp");
+        assert_eq!(pattern(&u), "-s 47.243.1.1 -p udp -m udp --sport 8443");
+        let s = cfg("-s -l 0.0.0.0:8443 -r 127.0.0.1:51820");
+        assert_eq!(pattern(&s), "-p tcp -m tcp --dport 8443");
+    }
 }
