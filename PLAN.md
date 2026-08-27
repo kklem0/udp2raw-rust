@@ -20,7 +20,7 @@ how to test on the Pis. Keep the **Status** section current.
 | Server (many clients, conv sockets, connection recovery, GC) | done |
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
-| Docker loopback e2e: Rust↔Rust all modes, Rust↔C++ interop | **16/16 pass** (2026-08-27, see run log below) |
+| Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`) |
 | Pi 4 measurements (loopback, C++ vs Rust) | **done 2026-08-27** — see "Raspberry Pi 4 benchmark" below; Pi 5 and a two-box measurement still to do |
 
 Docker e2e results are appended at the bottom of this file after each run.
