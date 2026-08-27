@@ -24,6 +24,10 @@ What is different from the C++ version:
 * No per-packet `/dev/urandom` reads, no per-packet heap churn in the hot path, and the
   code is memory-safe — it runs as root / with `CAP_NET_RAW` and parses untrusted packets.
 
+* **`--syscalls auto|mmsg|single`**: batched `recvmmsg`/`sendmmsg` where they pay off, one
+  `recvfrom`/`sendto` per packet on ARMv8.0 cores (Raspberry Pi 3/4: no hardware PAN, so the
+  kernel's software PAN makes every user-memory access inside a syscall expensive and the
+  batched calls cost ~10 % more CPU per packet — auto-detected, see PLAN.md).
 * **`--cipher-mode chacha20poly1305`** (Rust↔Rust only): a real AEAD, and the fast choice
   on CPUs without AES instructions (NEON ChaCha20). `--auth-mode` is ignored in this mode;
   anti-replay stays on. Both ends must run this port.
@@ -84,22 +88,23 @@ Both ends share the Pi's four cores here, which limits what the workers can add;
 figure varied between 4.7k and 10.2k across runs (it drops packets under bursts before it is
 CPU-bound), the Rust figures were stable.
 
-**Cipher modes on the Pi 4** (same setup, one session on 2026-08-27, current build; the
-loopback ceiling was ~15k pps in that session, so compare these rows only with each other).
-The last column is each daemon's user / sys CPU at a fixed 10k pps, server then client:
+**Cipher modes on the Pi 4** (same setup, 2026-08-27/28, current build with `--syscalls auto`;
+compare these rows only with each other — the C++ row is from the same session):
 
-| | loss-free pps | server / client CPU | user / sys at 10k pps |
-|---|---:|---|---|
-| C++, aes128cbc + md5 | 9,984 | 95 % / 83 % | — |
-| Rust `--threads 0`, aes128cbc + md5 | 11,968 | 88 % / 89 % | 26 / 46 %, 22 / 52 % |
-| Rust `--threads 0`, chacha20poly1305 | 13,984 | 86 % / 92 % | 17 / 47 %, 14 / 51 % |
-| Rust `--threads 2`, aes128cbc + md5 | 14,818 | 117 % / 121 % | 30 / 54 %, 23 / 59 % |
-| Rust `--threads 2`, chacha20poly1305 | 14,976 | 108 % / 108 % | 19 / 56 %, 14 / 59 % |
+| | loss-free pps | Mbit/s | server / client CPU |
+|---|---:|---:|---|
+| C++, aes128cbc + md5 | 9,984 | 104 | 95 % / 83 % |
+| Rust `--threads 0`, aes128cbc + md5 | 13,984 | 145 | 87 % / 86 % |
+| Rust `--threads 0`, chacha20poly1305 | 15,968 | 166 | 85 % / 86 % |
+| Rust `--threads 2`, aes128cbc + md5 | 14,976 | 156 | 112 % / 111 % |
+| Rust `--threads 2`, chacha20poly1305 | **18,863** | 196 | 117 % / 116 % |
 
-`chacha20poly1305` cuts the daemons' own (user) CPU by about a third on this CPU and adds
-17 % to the single-threaded loss-free rate; most of the per-packet cost on the Pi 4 is
-kernel time (sys), which no cipher removes. Use it Rust↔Rust; it is not wire-compatible
-with the C++.
+`chacha20poly1305` cuts the daemons' own (user) CPU by about a third on this CPU (at 10k pps:
+17 % vs 26 % on the server, 14 % vs 22 % on the client); most of the per-packet cost on the
+Pi 4 is kernel time, which no cipher removes. Use it Rust↔Rust; it is not wire-compatible
+with the C++. The same measurement caught the `recvmmsg`/`sendmmsg` build costing 10 % more
+CPU per packet than its predecessor on this CPU — the story and the fix (`--syscalls`) are in
+[PLAN.md](PLAN.md).
 
 **Docker, arm64, daemons pinned to 4 cores each** (fast cores, so only the ratios matter;
 `--aes-backend table` forces the Pi 4's software-AES code path):
@@ -115,10 +120,10 @@ with the C++.
 Where the difference comes from: table-driven AES instead of a bitsliced fallback on CPUs
 without AES instructions, batched socket drains (the C++ handles one packet per event-loop
 iteration and loses packets under bursts), and crypto on worker threads with batched
-handoff. With two workers the I/O thread's syscalls become the limit; the current build
-batches them with `recvmmsg`/`sendmmsg` (not yet re-measured in Docker; on the Pi 4 that
-batching costs more kernel time than the per-packet syscalls it replaced — see
-[PLAN.md](PLAN.md)).
+handoff. With two workers the I/O thread's syscalls become the limit; the current build drains
+and flushes sockets in batches (pooled buffers, one flush per event-loop round) and uses
+`recvmmsg`/`sendmmsg` only where they are cheaper than per-packet calls (`--syscalls auto`:
+a few percent on fast cores, a 10 % loss on the Pi 4 — see [PLAN.md](PLAN.md)).
 
 ## Tests
 

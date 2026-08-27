@@ -8,6 +8,23 @@ pub mod raw;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub use crate::types::{Syscalls, cpu_has_lse};
+
+static SINGLE_SYSCALLS: AtomicBool = AtomicBool::new(false);
+
+/// Select the syscall flavour for the whole process (call once at startup); returns the
+/// resolved choice.
+pub fn set_syscalls(mode: Syscalls) -> Syscalls {
+    let r = mode.resolve();
+    SINGLE_SYSCALLS.store(r == Syscalls::Single, Ordering::Relaxed);
+    r
+}
+
+fn single_syscalls() -> bool {
+    SINGLE_SYSCALLS.load(Ordering::Relaxed)
+}
 
 /// A reusable `recvmmsg` batch: `n` buffers plus one source address per message.
 /// `A` is the sockaddr type to fill (`libc::sockaddr_ll` for AF_PACKET, `sockaddr_storage`
@@ -51,6 +68,9 @@ impl<A: Copy> RecvBatch<A> {
         if n == 0 {
             return Ok(0);
         }
+        if single_syscalls() {
+            return self.recv_single(fd);
+        }
         for i in 0..n {
             self.iovs[i].iov_base = self.bufs[i].as_mut_ptr() as *mut libc::c_void;
             self.iovs[i].iov_len = self.bufs[i].len();
@@ -76,6 +96,31 @@ impl<A: Copy> RecvBatch<A> {
             self.lens[i] = self.msgs[i].msg_len as usize;
         }
         Ok(r as usize)
+    }
+
+    /// Same contract as [`recv`](Self::recv) with one `recvfrom` per datagram: stops at the
+    /// first `EAGAIN` (or, after at least one datagram, at any error, which the next call
+    /// reports again).
+    fn recv_single(&mut self, fd: RawFd) -> io::Result<usize> {
+        let n = self.bufs.len();
+        let mut got = 0usize;
+        while got < n {
+            let mut alen = std::mem::size_of::<A>() as libc::socklen_t;
+            let buf = &mut self.bufs[got];
+            let r = unsafe {
+                libc::recvfrom(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT, &mut self.addrs[got] as *mut A as *mut libc::sockaddr, &mut alen)
+            };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if got > 0 || e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
+                    break;
+                }
+                return Err(e);
+            }
+            self.lens[got] = r as usize;
+            got += 1;
+        }
+        Ok(got)
     }
 }
 
@@ -117,32 +162,41 @@ impl SendScratch {
     }
 }
 
-/// Send all packets with `sendmmsg` (chunks of [`SEND_CHUNK`]). A packet the kernel refuses
-/// is skipped (UDP semantics); returns how many were accepted.
+/// Fill `out` with the sockaddr for `dst`; returns its length.
+fn fill_addr(dst: &TxDst, out: &mut libc::sockaddr_storage) -> libc::socklen_t {
+    match *dst {
+        TxDst::Ip(ip) => {
+            let (sa, l) = addr::to_sockaddr(SocketAddr::new(ip, 0));
+            *out = sa;
+            l
+        }
+        TxDst::Sock(a) => {
+            let (sa, l) = addr::to_sockaddr(a);
+            *out = sa;
+            l
+        }
+        TxDst::L2(ll) => {
+            unsafe {
+                std::ptr::copy_nonoverlapping(&ll as *const _ as *const u8, out as *mut _ as *mut u8, std::mem::size_of::<libc::sockaddr_ll>());
+            }
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t
+        }
+    }
+}
+
+/// Send all packets: one `sendmmsg` per chunk of [`SEND_CHUNK`], or one `sendto` per packet
+/// (see [`Syscalls`]). A packet the kernel refuses is skipped (UDP semantics); a full socket
+/// buffer drops the rest of the chunk. Returns how many were accepted.
 pub fn send_batch(fd: RawFd, pkts: &[TxPacket], sc: &mut SendScratch) -> usize {
+    if single_syscalls() {
+        return send_single(fd, pkts, sc);
+    }
     let mut accepted = 0usize;
     for chunk in pkts.chunks(SEND_CHUNK) {
         let n = chunk.len();
         sc.ensure(n);
         for (i, p) in chunk.iter().enumerate() {
-            let alen = match p.dst {
-                TxDst::Ip(ip) => {
-                    let (sa, l) = addr::to_sockaddr(SocketAddr::new(ip, 0));
-                    sc.addrs[i] = sa;
-                    l
-                }
-                TxDst::Sock(a) => {
-                    let (sa, l) = addr::to_sockaddr(a);
-                    sc.addrs[i] = sa;
-                    l
-                }
-                TxDst::L2(ll) => {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(&ll as *const _ as *const u8, &mut sc.addrs[i] as *mut _ as *mut u8, std::mem::size_of::<libc::sockaddr_ll>());
-                    }
-                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t
-                }
-            };
+            let alen = fill_addr(&p.dst, &mut sc.addrs[i]);
             sc.iovs[i].iov_base = p.buf[p.off..].as_ptr() as *mut libc::c_void;
             sc.iovs[i].iov_len = p.buf.len() - p.off;
             let h = &mut sc.msgs[i].msg_hdr;
@@ -173,6 +227,32 @@ pub fn send_batch(fd: RawFd, pkts: &[TxPacket], sc: &mut SendScratch) -> usize {
             }
             done += r as usize;
             accepted += r as usize;
+        }
+    }
+    accepted
+}
+
+fn send_single(fd: RawFd, pkts: &[TxPacket], sc: &mut SendScratch) -> usize {
+    sc.ensure(1);
+    let mut accepted = 0usize;
+    for p in pkts {
+        let alen = fill_addr(&p.dst, &mut sc.addrs[0]);
+        let data = &p.buf[p.off..];
+        loop {
+            let r = unsafe { libc::sendto(fd, data.as_ptr() as *const libc::c_void, data.len(), libc::MSG_DONTWAIT, &sc.addrs[0] as *const _ as *const libc::sockaddr, alen) };
+            if r >= 0 {
+                accepted += 1;
+                break;
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return accepted,
+                _ => {
+                    log::trace!("sendto failed: {e}");
+                    break;
+                }
+            }
         }
     }
     accepted

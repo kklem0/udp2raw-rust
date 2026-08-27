@@ -3,7 +3,7 @@
 
 use crate::consts::*;
 use crate::crypto::{AesBackend, AuthMode, CipherMode};
-use crate::types::{ProgramMode, RawMode};
+use crate::types::{ProgramMode, RawMode, Syscalls};
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr};
 
@@ -103,6 +103,9 @@ struct Cli {
     /// AES implementation: auto (default), hw, table, fixslice.
     #[arg(long = "aes-backend")]
     aes_backend: Option<String>,
+    /// Socket syscalls: auto (default), mmsg, single.
+    #[arg(long = "syscalls")]
+    syscalls: Option<String>,
     #[arg(short = 'h', long)]
     help: bool,
 }
@@ -157,6 +160,7 @@ pub struct Config {
     pub debug: bool,
     pub threads: usize,
     pub aes_backend: AesBackend,
+    pub syscalls: Syscalls,
 }
 
 impl Config {
@@ -199,6 +203,10 @@ other options:
     --threads             <number>        crypto worker threads, 0 = single-threaded (default: auto)
     --aes-backend         <string>        auto(default),hw,table,fixslice. auto = CPU AES instructions
                                           if present, otherwise table-driven software AES
+    --syscalls            <string>        auto(default),mmsg,single. mmsg = recvmmsg/sendmmsg per batch,
+                                          single = recvfrom/sendto per packet. auto = single on ARMv8.0
+                                          CPUs (Cortex-A53/A72: no hardware PAN, so every user-memory
+                                          access in a syscall is expensive), mmsg otherwise
     --conf-file           <string>        read options from a configuration file instead of command line.
                                           check example.conf in repo for format
     --fifo                <string>        use a fifo(named pipe) for sending commands to the running program,
@@ -421,6 +429,10 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         Some(s) => AesBackend::parse(s).ok_or_else(|| format!("no such aes backend {s}"))?,
         None => AesBackend::Auto,
     };
+    let syscalls = match &cli.syscalls {
+        Some(s) => Syscalls::parse(s).ok_or_else(|| format!("no such syscalls mode {s} (auto, mmsg, single)"))?,
+        None => Syscalls::Auto,
+    };
     let log_level = cli.log_level.unwrap_or(4);
     if !(0..=6).contains(&log_level) {
         return Err("invalid log_level".into());
@@ -492,6 +504,7 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         debug: cli.debug,
         threads: cli.threads.unwrap_or_else(default_threads),
         aes_backend,
+        syscalls,
     };
     Ok(ParseOutcome::Run(Box::new(cfg)))
 }
@@ -513,6 +526,17 @@ mod tests {
         assert_eq!(parse_conf_line("# comment").unwrap(), Vec::<String>::new());
         assert_eq!(parse_conf_line("").unwrap(), Vec::<String>::new());
         assert!(parse_conf_line("aaa").is_err());
+    }
+
+    #[test]
+    fn syscalls_option() {
+        let out = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --syscalls single")).unwrap();
+        let ParseOutcome::Run(cfg) = out else { panic!() };
+        assert_eq!(cfg.syscalls, Syscalls::Single);
+        let out = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2")).unwrap();
+        let ParseOutcome::Run(cfg) = out else { panic!() };
+        assert_eq!(cfg.syscalls, Syscalls::Auto);
+        assert!(parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --syscalls batch")).is_err());
     }
 
     #[test]

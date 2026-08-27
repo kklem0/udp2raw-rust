@@ -6,7 +6,8 @@
 #       -v "$PWD":/work -v /path/to/udp2raw-cpp:/cpp:ro \
 #       -v udp2raw-cargo:/usr/local/cargo/registry -v udp2raw-target:/work/target-linux \
 #       udp2raw-rust-dev tools/docker/e2e.sh [quick]
-#   (SYS_ADMIN is only needed for the veth/network-namespace cases; ONLY=<regex> runs a subset)
+#   (SYS_ADMIN is only needed for the veth/network-namespace cases; ONLY=<regex> runs a subset;
+#    RUST_EXTRA="--syscalls single" adds options to every Rust daemon, not to the C++ ones)
 #
 # Topology (everything on 127.0.0.1):
 #   udp_probe -> :3333 (client -l) ==raw tunnel==> :4096 (server -l) -> :7777 (udp_echo, server -r)
@@ -65,11 +66,12 @@ run_case() {
     local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6 probe=${7:-"2000 1000 2"} noa=${8:-}
     if [ -n "${ONLY:-}" ] && ! [[ "$name" =~ ${ONLY} ]]; then return; fi
     local A="-a"; [ "$noa" = noa ] && A=""
+    local sx="" cx=""; [ "$sbin" = "$RUST" ] && sx=${RUST_EXTRA:-}; [ "$cbin" = "$RUST" ] && cx=${RUST_EXTRA:-}
     echo "== case: $name"
     python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
-    $sbin -s -l 127.0.0.1:4096 -r 127.0.0.1:7777 -k pw $A $common $sargs > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
+    $sbin -s -l 127.0.0.1:4096 -r 127.0.0.1:7777 -k pw $A $common $sargs $sx > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
     sleep 0.5
-    $cbin -c -l 127.0.0.1:3333 -r 127.0.0.1:4096 -k pw $A $common $cargs > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
+    $cbin -c -l 127.0.0.1:3333 -r 127.0.0.1:4096 -k pw $A $common $cargs $cx > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
     local ok=1
     if ! wait_for "client_ready" "$LOGDIR/$name.client.log" 20; then
         echo "   client never became ready"; ok=0
@@ -109,12 +111,13 @@ veth_teardown() { ip netns del peer 2>/dev/null; ip link del veth0 2>/dev/null; 
 run_veth_case() {
     local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6
     if [ -n "${ONLY:-}" ] && ! [[ "$name" =~ ${ONLY} ]]; then return; fi
+    local sx="" cx=""; [ "$sbin" = "$RUST" ] && sx=${RUST_EXTRA:-}; [ "$cbin" = "$RUST" ] && cx=${RUST_EXTRA:-}
     echo "== case: $name (veth)"
     if ! veth_setup 2> "$LOGDIR/$name.veth.log"; then echo "   veth setup failed: $(tail -1 "$LOGDIR/$name.veth.log")"; FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; return; fi
     ip netns exec peer python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
-    ip netns exec peer $sbin -s -l 10.99.0.2:4096 -r 127.0.0.1:7777 -k pw -a $common $sargs > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
+    ip netns exec peer $sbin -s -l 10.99.0.2:4096 -r 127.0.0.1:7777 -k pw -a $common $sargs $sx > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
     sleep 0.5
-    $cbin -c -l 127.0.0.1:3333 -r 10.99.0.2:4096 -k pw -a $common $cargs > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
+    $cbin -c -l 127.0.0.1:3333 -r 10.99.0.2:4096 -k pw -a $common $cargs $cx > "$LOGDIR/$name.client.log" 2>&1 & pids+=($!)
     local ok=1
     if ! wait_for "client_ready" "$LOGDIR/$name.client.log" 20; then echo "   client never became ready"; ok=0
     else sleep 0.3; python3 tools/udp_probe.py 127.0.0.1 3333 2000 1000 2 || ok=0; fi

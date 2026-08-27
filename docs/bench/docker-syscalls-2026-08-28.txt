@@ -1,0 +1,18 @@
+# 2026-08-27T16:44-16:50 UTC, Docker Desktop (Apple Silicon), rust:1-bookworm arm64, kernel 6.12.76-linuxkit (virtual ARMv8.2+ CPU: hardware PAN)
+# --syscalls mmsg vs single with the fixed build (f786a8c4 = 3c380ad + --syscalls), no-drop-rate search (bench_ndr.sh, ITER=5 SECS=2 HI=400000),
+# split cores: server cpus 0-3, client cpus 4-7, generator cpus 8-9; two rounds. rmem_max could not be raised in this container (same as the earlier Docker runs).
+# Reading: mmsg is worth a few percent at most on a CPU with hardware PAN, so `auto` keeps mmsg there.
+NDR single_t0_table | ndr_pps=124284 mbps=1293 size=1300 | server_cpu=87% client_cpu=95% sys_busy=179% sys_irq=15% (of 1600%)
+NDR single_t2_table | ndr_pps=297512 mbps=3094 size=1300 | server_cpu=258% client_cpu=260% sys_busy=504% sys_irq=46% (of 1600%)
+NDR single_t2_hw | ndr_pps=307925 mbps=3202 size=1300 | server_cpu=192% client_cpu=189% sys_busy=357% sys_irq=42% (of 1600%)
+NDR mmsg_t0_table | ndr_pps=136905 mbps=1424 size=1300 | server_cpu=92% client_cpu=98% sys_busy=188% sys_irq=16% (of 1600%)
+NDR mmsg_t2_table | ndr_pps=298630 mbps=3106 size=1300 | server_cpu=255% client_cpu=254% sys_busy=499% sys_irq=44% (of 1600%)
+NDR mmsg_t2_hw | ndr_pps=310734 mbps=3232 size=1300 | server_cpu=191% client_cpu=182% sys_busy=352% sys_irq=40% (of 1600%)
+NDR single_t0_table | ndr_pps=135022 mbps=1404 size=1300 | server_cpu=94% client_cpu=99% sys_busy=190% sys_irq=16% (of 1600%)
+NDR single_t2_table | ndr_pps=298297 mbps=3102 size=1300 | server_cpu=257% client_cpu=259% sys_busy=503% sys_irq=40% (of 1600%)
+NDR single_t2_hw | ndr_pps=282014 mbps=2933 size=1300 | server_cpu=184% client_cpu=176% sys_busy=334% sys_irq=42% (of 1600%)
+NDR mmsg_t0_table | ndr_pps=136626 mbps=1421 size=1300 | server_cpu=94% client_cpu=98% sys_busy=193% sys_irq=14% (of 1600%)
+NDR mmsg_t2_table | ndr_pps=298612 mbps=3106 size=1300 | server_cpu=258% client_cpu=254% sys_busy=497% sys_irq=40% (of 1600%)
+NDR mmsg_t2_hw | ndr_pps=323056 mbps=3360 size=1300 | server_cpu=195% client_cpu=188% sys_busy=362% sys_irq=42% (of 1600%)
+# strace -c in the same container at 10k pps (50k packets, 5 s), client: mmsg build = 788 sendmmsg + 2350 recvmmsg (781 EAGAIN) + 1578 epoll_pwait;
+#   60a36d6 = 36870 sendto + 36896 recvfrom + 579 epoll_pwait. Server: both builds send one sendto per packet to the sink; mmsg build 2332 recvmmsg vs 36321 recvfrom.
