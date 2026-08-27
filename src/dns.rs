@@ -267,7 +267,7 @@ fn interpret(m: &Message, qname: &Name, server: SocketAddr, via_tcp: bool) -> Re
                 if cnames.len() >= MAX_CNAME_HOPS {
                     return Err(DnsError::Malformed("cname chain too long".into()));
                 }
-                if target == name || cnames.iter().any(|c| c == &target.to_ascii()) {
+                if target == name || cnames.iter().any(|c| c.eq_ignore_ascii_case(&target.to_ascii())) {
                     return Err(DnsError::Malformed("cname loop".into()));
                 }
                 cnames.push(target.to_ascii());

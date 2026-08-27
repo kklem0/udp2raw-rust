@@ -473,7 +473,11 @@ pub fn save_cache(path: &Path, host: &str, port: u16, addr: Ipv4Addr) -> io::Res
     }
     let saved = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let body = format!("# udp2raw endpoint cache: the last address whose handshake succeeded\nhost={host}\nport={port}\naddr={addr}\nsaved={saved}\n");
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // append (not replace-extension: a dotted hostname filename would be mangled) a suffix,
+    // keeping the temp file in the same directory so the rename is atomic
+    let mut tmp_name = path.file_name().map(|f| f.to_os_string()).unwrap_or_else(|| std::ffi::OsString::from("endpoint"));
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
