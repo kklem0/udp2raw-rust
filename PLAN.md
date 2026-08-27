@@ -21,7 +21,7 @@ how to test on the Pis. Keep the **Status** section current.
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
 | Docker loopback e2e: Rust↔Rust all modes, Rust↔C++ interop | **16/16 pass** (2026-08-27, see run log below) |
-| Pi 4 / Pi 5 measurements | **not done — first job for the next session** |
+| Pi 4 measurements (loopback, C++ vs Rust) | **done 2026-08-27** — see "Raspberry Pi 4 benchmark" below; Pi 5 and a two-box measurement still to do |
 
 Docker e2e results are appended at the bottom of this file after each run.
 
@@ -138,6 +138,76 @@ bare:   [iv u64][pad u64]['b'][payload]            handshake payload = 3 × u32 
 safer:  [my_id u32][oppsite_id u32][seq u64]['h'|'d'][roller][payload]; 'd' payload = [conv u32][datagram]
 gro:    [len u16][encrypted] with the first 16 bytes ECB-encrypted (xor: first 2 bytes ^ gro_xor)
 ```
+
+## Raspberry Pi 4 benchmark (2026-08-27)
+
+Box: `wutong`, Raspberry Pi 4 (Cortex-A72 ×4, 1.8 GHz, no AES/SHA instructions), Ubuntu
+24.04, kernel 6.8. It is a live router (dnsmasq, VLANs, WireGuard, a 38-rule INPUT chain,
+conntrack) running the production `udp2raw-fb13730-arm64-hw-aes-static` as a client; the
+benchmark used separate ports on loopback and never touched that instance. C++ reference =
+that production binary (on the Pi 4 it uses the portable C AES). Rust = this repo at
+`7b12ba1` (table AES). Tools: `tools/bench/` (static `udpbench` generator/sink,
+`bench_ndr.sh`, `run_ndr_pi.sh`); raw logs in `docs/bench/`.
+
+Topology: `udpbench blast → client :33333 → raw tunnel (lo) → server :34096 → udpbench sink
+:37777`, both daemons on the Pi, `-a --fix-gro`, 1300-byte datagrams, governor pinned to
+`performance`, `rmem_max` raised for the run. **No-drop rate** = highest offered rate with
+≤2 % loss (binary search, 4 s per step, exact sent/received counts).
+
+| case (production config: faketcp, aes128cbc, md5, --fix-gro unless noted) | no-drop pps | Mbit/s | server / client CPU | vs C++ |
+|---|---:|---:|---|---:|
+| C++ ↔ C++ | 4,672 | 49 | 55 % / 46 % | 1.00× |
+| Rust ↔ Rust `--threads 0` | 9,185 | 96 | 67 % / 66 % | **1.97×** |
+| Rust ↔ Rust `--threads 0 --aes-backend fixslice` (control) | 5,616 | 58 | 43 % / 70 % | 1.20× |
+| Rust ↔ Rust `--threads 1` | 9,284 | 97 | 81 % / 83 % | 1.99× |
+| Rust ↔ Rust `--threads 2` | 8,267 | 86 | 82 % / 75 % | 1.77× |
+| Rust ↔ Rust `--threads 3` | 8,410 | 87 | 84 % / 83 % | 1.80× |
+| C++ server ↔ Rust client `--threads 2` | 5,616 | 58 | 60 % / 54 % | 1.20× |
+| Rust server `--threads 3` ↔ C++ client | 6,436 | 67 | 90 % / 64 % | 1.38× |
+| Rust server `--threads 3` ↔ Rust client `--threads 0` | 9,360 | 97 | 95 % / 69 % | 2.00× |
+| Rust server `--threads 3` ↔ Rust client `--threads 2` | 8,408 | 87 | 90 % / 81 % | 1.80× |
+| C++ ↔ C++, `--cipher-mode none --auth-mode hmac_sha1` | 8,344 | 87 | 76 % / 67 % | — |
+| Rust ↔ Rust `--threads 2`, `none + hmac_sha1` | 11,211 | 117 | 88 % / 92 % | 1.34× vs C++ same mode |
+
+Earlier "overload" pass (offered ≈ 29k pps, 10 s, steady-state received rate) with the
+*first* Rust binary (bitsliced AES): C++ 7,128 pps at 77 %/80 % CPU; Rust t0 5,864; t1
+6,064; t2 7,464. That run was cut short (thermal cooldowns) and is superseded by the table.
+
+What the numbers mean:
+
+* **The AES implementation dominates on the A72.** The `aes` crate's bitsliced fallback
+  made the Rust client *slower* than C++ (serial CBC encryption cannot batch blocks); the
+  table-driven AES (`crypto/aes_table.rs`, auto-selected when the CPU lacks AES
+  instructions) gives 9.2k vs 5.6k pps on the same binary. Golden vectors pass for every
+  backend.
+* **This box saturates in the kernel at ≈10k tunnel packets/s (~100 Mbit/s of 1300-byte
+  datagrams)**: above that the received rate stops growing regardless of offered load while
+  the daemons sit at 65–85 % CPU and IRQ/softirq burns a full core (each tunnel packet is
+  three loopback packets through conntrack and the 38-rule INPUT chain; `softnet_stat`
+  shows `time_squeeze` on CPU0). Rust reaches that ceiling loss-free; C++ starts losing
+  packets at ~5k pps under the generator's 64-packet bursts, well before it is CPU-bound —
+  one packet per event-loop iteration vs the Rust loop's 64-packet drains.
+* **Threads cannot show a gain against a kernel ceiling**; here they only add handoff CPU
+  (t1 = t0 throughput at +15 % CPU). Client-side isolation (fast Rust server): Rust
+  `--threads 0` client 9,360 pps vs C++ client 6,436 pps (1.45×) at similar client CPU.
+* Cheaper crypto (`none + hmac_sha1`, i.e. integrity only with WireGuard inside) lifts C++
+  to 8.3k pps and Rust to 11.2k pps.
+* Interop cases (C++ on one side) worked in both directions at every step (probe 500/500).
+
+Caveats and next steps:
+
+* Both ends on one 4-core box, on loopback, on a busy router — the absolute numbers are a
+  lower bound for the real deployment (Pi = client, VPS = server, traffic over eth0, no
+  loopback triple-processing). Measure that next: the same scripts work with the sink on
+  the VPS.
+* `tools/bench/run_fixed_pi.sh` (prepared, not yet run) offers a fixed 7k pps with 8-packet
+  bursts and reports **user vs system CPU per daemon**, which isolates the daemons' own
+  cost from kernel work and settles the burst-sensitivity question. Run it next, then the
+  Pi 5 (hardware AES).
+* The generator on the Pi tops out near 29k pps offered (`usleep` pacing); enough for these
+  capacities, not for a Pi 5.
+* `net.core.rmem_max` is 212992 on this box, so the daemons' requested 1 MB socket buffers
+  are capped in production; consider raising it (or `--force-sock-buf`).
 
 ## e2e run log
 

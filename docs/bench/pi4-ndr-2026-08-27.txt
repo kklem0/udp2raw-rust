@@ -1,0 +1,101 @@
+# 2026-08-27T21:57:10+08:00 host=wutong kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 no-drop-rate search hi=120000 secs=4 max_loss=0.02
+  ndr-iter cpp_cpp rate=60000 offered=28472 sent=113920 recv=20724 loss=0.8181 server_cpu=66% client_cpu=76% sys_busy=297% irq=96%
+  ndr-iter cpp_cpp rate=30000 offered=28761 sent=115136 recv=27901 loss=0.7577 server_cpu=74% client_cpu=82% sys_busy=305% irq=92%
+  ndr-iter cpp_cpp rate=15000 offered=14992 sent=59968 recv=31539 loss=0.4741 server_cpu=80% client_cpu=80% sys_busy=289% irq=83%
+  ndr-iter cpp_cpp rate=7500 offered=7488 sent=29952 recv=27740 loss=0.0739 server_cpu=76% client_cpu=71% sys_busy=289% irq=78%
+  ndr-iter cpp_cpp rate=3750 offered=3744 sent=14976 recv=14976 loss=0.0000 server_cpu=43% client_cpu=35% sys_busy=203% irq=54%
+  ndr-iter cpp_cpp rate=5625 offered=5616 sent=22464 recv=20066 loss=0.1067 server_cpu=61% client_cpu=54% sys_busy=281% irq=76%
+  ndr-iter cpp_cpp rate=4687 offered=4672 sent=18688 recv=18688 loss=0.0000 server_cpu=55% client_cpu=46% sys_busy=231% irq=76%
+NDR cpp_cpp | ndr_pps=4672 mbps=49 size=1300 | server_cpu=55% client_cpu=46% sys_busy=231% sys_irq=76% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.17s | warnlines=0 temp=74.0C
+  ndr-iter rust_rust_t0 rate=60000 offered=29941 sent=119808 recv=37559 loss=0.6865 server_cpu=69% client_cpu=80% sys_busy=290% irq=102%
+  ndr-iter rust_rust_t0 rate=30000 offered=29060 sent=116288 recv=42069 loss=0.6382 server_cpu=74% client_cpu=77% sys_busy=290% irq=100%
+  ndr-iter rust_rust_t0 rate=15000 offered=14974 sent=59904 recv=42124 loss=0.2968 server_cpu=72% client_cpu=79% sys_busy=284% irq=87%
+  ndr-iter rust_rust_t0 rate=7500 offered=7488 sent=29952 recv=29952 loss=0.0000 server_cpu=54% client_cpu=54% sys_busy=252% irq=78%
+  ndr-iter rust_rust_t0 rate=11250 offered=11245 sent=44992 recv=38223 loss=0.1504 server_cpu=68% client_cpu=74% sys_busy=288% irq=95%
+  ndr-iter rust_rust_t0 rate=9375 offered=9360 sent=37440 recv=36739 loss=0.0187 server_cpu=67% client_cpu=66% sys_busy=263% irq=77%
+  ndr-iter rust_rust_t0 rate=10312 offered=10304 sent=41216 recv=39543 loss=0.0406 server_cpu=71% client_cpu=74% sys_busy=268% irq=90%
+NDR rust_rust_t0 | ndr_pps=9185 mbps=96 size=1300 | server_cpu=67% client_cpu=66% sys_busy=263% sys_irq=77% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.13s | warnlines=0 temp=74.5C
+  ndr-iter rust_rust_t0_fixslice rate=60000 offered=29520 sent=118080 recv=22094 loss=0.8129 server_cpu=44% client_cpu=71% sys_busy=301% irq=94%
+  ndr-iter rust_rust_t0_fixslice rate=30000 offered=27769 sent=111104 recv=20834 loss=0.8125 server_cpu=44% client_cpu=67% sys_busy=318% irq=80%
+  ndr-iter rust_rust_t0_fixslice rate=15000 offered=14992 sent=59968 recv=25335 loss=0.5775 server_cpu=50% client_cpu=81% sys_busy=265% irq=77%
+  ndr-iter rust_rust_t0_fixslice rate=7500 offered=7488 sent=29952 recv=26690 loss=0.1089 server_cpu=54% client_cpu=85% sys_busy=264% irq=72%
+  ndr-iter rust_rust_t0_fixslice rate=3750 offered=3744 sent=14976 recv=14976 loss=0.0000 server_cpu=30% client_cpu=50% sys_busy=213% irq=65%
+  ndr-iter rust_rust_t0_fixslice rate=5625 offered=5616 sent=22464 recv=22464 loss=0.0000 server_cpu=43% client_cpu=70% sys_busy=230% irq=57%
+  ndr-iter rust_rust_t0_fixslice rate=6562 offered=6559 sent=26240 recv=25662 loss=0.0220 server_cpu=53% client_cpu=81% sys_busy=275% irq=77%
+NDR rust_rust_t0_fixslice | ndr_pps=5616 mbps=58 size=1300 | server_cpu=43% client_cpu=70% sys_busy=230% sys_irq=57% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.19s | warnlines=0 temp=75.0C
+  ndr-iter rust_rust_t1 rate=60000 offered=24598 sent=98432 recv=34058 loss=0.6540 server_cpu=69% client_cpu=88% sys_busy=309% irq=94%
+  ndr-iter rust_rust_t1 rate=30000 offered=22173 sent=88768 recv=30926 loss=0.6516 server_cpu=65% client_cpu=79% sys_busy=322% irq=95%
+  ndr-iter rust_rust_t1 rate=15000 offered=14942 sent=59776 recv=43754 loss=0.2680 server_cpu=90% client_cpu=95% sys_busy=305% irq=81%
+  ndr-iter rust_rust_t1 rate=7500 offered=7488 sent=29952 recv=29952 loss=0.0000 server_cpu=72% client_cpu=68% sys_busy=265% irq=80%
+  ndr-iter rust_rust_t1 rate=11250 offered=11227 sent=44928 recv=40044 loss=0.1087 server_cpu=87% client_cpu=83% sys_busy=306% irq=82%
+  ndr-iter rust_rust_t1 rate=9375 offered=9360 sent=37440 recv=37137 loss=0.0081 server_cpu=81% client_cpu=83% sys_busy=276% irq=78%
+  ndr-iter rust_rust_t1 rate=10312 offered=10304 sent=41216 recv=33788 loss=0.1802 server_cpu=75% client_cpu=76% sys_busy=310% irq=85%
+NDR rust_rust_t1 | ndr_pps=9284 mbps=97 size=1300 | server_cpu=81% client_cpu=83% sys_busy=276% sys_irq=78% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.15s | warnlines=26 temp=76.0C
+  ndr-iter rust_rust_t2 rate=60000 offered=26522 sent=106240 recv=33974 loss=0.6802 server_cpu=74% client_cpu=92% sys_busy=298% irq=102%
+  ndr-iter rust_rust_t2 rate=30000 offered=23787 sent=95360 recv=34867 loss=0.6344 server_cpu=75% client_cpu=83% sys_busy=312% irq=97%
+  ndr-iter rust_rust_t2 rate=15000 offered=14951 sent=59840 recv=37906 loss=0.3665 server_cpu=78% client_cpu=93% sys_busy=306% irq=95%
+  ndr-iter rust_rust_t2 rate=7500 offered=7488 sent=29952 recv=29952 loss=0.0000 server_cpu=78% client_cpu=73% sys_busy=283% irq=81%
+  ndr-iter rust_rust_t2 rate=11250 offered=11241 sent=44992 recv=38909 loss=0.1352 server_cpu=82% client_cpu=90% sys_busy=302% irq=81%
+  ndr-iter rust_rust_t2 rate=9375 offered=9359 sent=37440 recv=34687 loss=0.0735 server_cpu=78% client_cpu=83% sys_busy=304% irq=82%
+  ndr-iter rust_rust_t2 rate=8437 offered=8432 sent=33728 recv=33068 loss=0.0196 server_cpu=82% client_cpu=75% sys_busy=284% irq=74%
+NDR rust_rust_t2 | ndr_pps=8267 mbps=86 size=1300 | server_cpu=82% client_cpu=75% sys_busy=284% sys_irq=74% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.21s | warnlines=12 temp=74.5C
+  ndr-iter rust_rust_t3 rate=60000 offered=19371 sent=77504 recv=29612 loss=0.6179 server_cpu=74% client_cpu=81% sys_busy=312% irq=86%
+  ndr-iter rust_rust_t3 rate=30000 offered=20543 sent=82240 recv=30976 loss=0.6233 server_cpu=72% client_cpu=82% sys_busy=312% irq=92%
+  ndr-iter rust_rust_t3 rate=15000 offered=14983 sent=59968 recv=40958 loss=0.3170 server_cpu=93% client_cpu=95% sys_busy=311% irq=83%
+  ndr-iter rust_rust_t3 rate=7500 offered=7487 sent=29952 recv=29952 loss=0.0000 server_cpu=82% client_cpu=75% sys_busy=281% irq=75%
+  ndr-iter rust_rust_t3 rate=11250 offered=11222 sent=44928 recv=37932 loss=0.1557 server_cpu=87% client_cpu=93% sys_busy=306% irq=82%
+  ndr-iter rust_rust_t3 rate=9375 offered=9360 sent=37440 recv=35729 loss=0.0457 server_cpu=83% client_cpu=85% sys_busy=296% irq=73%
+  ndr-iter rust_rust_t3 rate=8437 offered=8425 sent=33728 recv=33638 loss=0.0027 server_cpu=84% client_cpu=83% sys_busy=289% irq=77%
+NDR rust_rust_t3 | ndr_pps=8410 mbps=87 size=1300 | server_cpu=84% client_cpu=83% sys_busy=289% sys_irq=77% (of 400%) | probe: sent=500 received=425 corrupt=0 size=1000 flows=2 ratio=0.8500 elapsed=5.11s | warnlines=0 temp=76.4C
+  ndr-iter cpp_server_rust_client_t2 rate=60000 offered=25277 sent=101184 recv=21855 loss=0.7840 server_cpu=62% client_cpu=96% sys_busy=307% irq=96%
+  ndr-iter cpp_server_rust_client_t2 rate=30000 offered=28890 sent=115584 recv=28500 loss=0.7534 server_cpu=73% client_cpu=111% sys_busy=298% irq=95%
+  ndr-iter cpp_server_rust_client_t2 rate=15000 offered=14973 sent=59904 recv=27307 loss=0.5442 server_cpu=73% client_cpu=110% sys_busy=286% irq=89%
+  ndr-iter cpp_server_rust_client_t2 rate=7500 offered=7488 sent=29952 recv=24593 loss=0.1789 server_cpu=77% client_cpu=81% sys_busy=281% irq=86%
+  ndr-iter cpp_server_rust_client_t2 rate=3750 offered=3744 sent=14976 recv=14976 loss=0.0000 server_cpu=45% client_cpu=40% sys_busy=203% irq=71%
+  ndr-iter cpp_server_rust_client_t2 rate=5625 offered=5613 sent=22464 recv=22464 loss=0.0000 server_cpu=60% client_cpu=54% sys_busy=230% irq=62%
+  ndr-iter cpp_server_rust_client_t2 rate=6562 offered=6556 sent=26240 recv=25375 loss=0.0330 server_cpu=71% client_cpu=67% sys_busy=261% irq=67%
+NDR cpp_server_rust_client_t2 | ndr_pps=5616 mbps=58 size=1300 | server_cpu=60% client_cpu=54% sys_busy=230% sys_irq=62% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.19s | warnlines=11 temp=74.5C
+  ndr-iter rustsrv_t3_cpp_client rate=60000 offered=29100 sent=116416 recv=31975 loss=0.7253 server_cpu=84% client_cpu=73% sys_busy=304% irq=94%
+  ndr-iter rustsrv_t3_cpp_client rate=30000 offered=27341 sent=109376 recv=29955 loss=0.7261 server_cpu=93% client_cpu=70% sys_busy=308% irq=91%
+  ndr-iter rustsrv_t3_cpp_client rate=15000 offered=14990 sent=59968 recv=33863 loss=0.4353 server_cpu=103% client_cpu=77% sys_busy=297% irq=80%
+  ndr-iter rustsrv_t3_cpp_client rate=7500 offered=7487 sent=29952 recv=27000 loss=0.0986 server_cpu=92% client_cpu=68% sys_busy=302% irq=72%
+  ndr-iter rustsrv_t3_cpp_client rate=3750 offered=3744 sent=14976 recv=14976 loss=0.0000 server_cpu=57% client_cpu=38% sys_busy=219% irq=53%
+  ndr-iter rustsrv_t3_cpp_client rate=5625 offered=5616 sent=22464 recv=22464 loss=0.0000 server_cpu=90% client_cpu=57% sys_busy=270% irq=71%
+  ndr-iter rustsrv_t3_cpp_client rate=6562 offered=6557 sent=26240 recv=25743 loss=0.0189 server_cpu=90% client_cpu=64% sys_busy=286% irq=74%
+NDR rustsrv_t3_cpp_client | ndr_pps=6436 mbps=67 size=1300 | server_cpu=90% client_cpu=64% sys_busy=286% sys_irq=74% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.17s | warnlines=0 temp=75.5C
+  ndr-iter rustsrv_t3_rust_client_t0 rate=60000 offered=23832 sent=95488 recv=33340 loss=0.6508 server_cpu=82% client_cpu=60% sys_busy=311% irq=94%
+  ndr-iter rustsrv_t3_rust_client_t0 rate=30000 offered=26478 sent=105920 recv=39914 loss=0.6232 server_cpu=94% client_cpu=70% sys_busy=301% irq=92%
+  ndr-iter rustsrv_t3_rust_client_t0 rate=15000 offered=14987 sent=59968 recv=38080 loss=0.3650 server_cpu=92% client_cpu=69% sys_busy=295% irq=92%
+  ndr-iter rustsrv_t3_rust_client_t0 rate=7500 offered=7488 sent=29952 recv=29924 loss=0.0009 server_cpu=79% client_cpu=56% sys_busy=267% irq=70%
+  ndr-iter rustsrv_t3_rust_client_t0 rate=11250 offered=11207 sent=44864 recv=37923 loss=0.1547 server_cpu=91% client_cpu=69% sys_busy=301% irq=87%
+  ndr-iter rustsrv_t3_rust_client_t0 rate=9375 offered=9360 sent=37440 recv=37440 loss=0.0000 server_cpu=95% client_cpu=69% sys_busy=270% irq=83%
+  ndr-iter rustsrv_t3_rust_client_t0 rate=10312 offered=10285 sent=41152 recv=40085 loss=0.0259 server_cpu=100% client_cpu=71% sys_busy=291% irq=85%
+NDR rustsrv_t3_rust_client_t0 | ndr_pps=9360 mbps=97 size=1300 | server_cpu=95% client_cpu=69% sys_busy=270% sys_irq=83% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.09s | warnlines=0 temp=76.4C
+  ndr-iter rustsrv_t3_rust_client_t2 rate=60000 offered=22575 sent=90368 recv=36376 loss=0.5975 server_cpu=81% client_cpu=86% sys_busy=310% irq=92%
+  ndr-iter rustsrv_t3_rust_client_t2 rate=30000 offered=21694 sent=86848 recv=35184 loss=0.5949 server_cpu=78% client_cpu=86% sys_busy=314% irq=89%
+  ndr-iter rustsrv_t3_rust_client_t2 rate=15000 offered=14348 sent=57408 recv=24775 loss=0.5684 server_cpu=64% client_cpu=67% sys_busy=324% irq=81%
+  ndr-iter rustsrv_t3_rust_client_t2 rate=7500 offered=7487 sent=29952 recv=29881 loss=0.0024 server_cpu=81% client_cpu=71% sys_busy=280% irq=72%
+  ndr-iter rustsrv_t3_rust_client_t2 rate=11250 offered=11245 sent=44992 recv=36862 loss=0.1807 server_cpu=86% client_cpu=93% sys_busy=301% irq=79%
+  ndr-iter rustsrv_t3_rust_client_t2 rate=9375 offered=9360 sent=37440 recv=36018 loss=0.0380 server_cpu=92% client_cpu=84% sys_busy=283% irq=65%
+  ndr-iter rustsrv_t3_rust_client_t2 rate=8437 offered=8432 sent=33728 recv=33634 loss=0.0028 server_cpu=90% client_cpu=81% sys_busy=281% irq=69%
+NDR rustsrv_t3_rust_client_t2 | ndr_pps=8408 mbps=87 size=1300 | server_cpu=90% client_cpu=81% sys_busy=281% sys_irq=69% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.14s | warnlines=10 temp=75.0C
+  ndr-iter cpp_cpp_none_hmac rate=60000 offered=31543 sent=126208 recv=32697 loss=0.7409 server_cpu=73% client_cpu=78% sys_busy=298% irq=99%
+  ndr-iter cpp_cpp_none_hmac rate=30000 offered=29083 sent=116352 recv=28610 loss=0.7541 server_cpu=69% client_cpu=82% sys_busy=289% irq=96%
+  ndr-iter cpp_cpp_none_hmac rate=15000 offered=14992 sent=59968 recv=31207 loss=0.4796 server_cpu=71% client_cpu=74% sys_busy=298% irq=88%
+  ndr-iter cpp_cpp_none_hmac rate=7500 offered=7488 sent=29952 recv=29371 loss=0.0194 server_cpu=69% client_cpu=60% sys_busy=243% irq=71%
+  ndr-iter cpp_cpp_none_hmac rate=11250 offered=11240 sent=44992 recv=30070 loss=0.3317 server_cpu=77% client_cpu=73% sys_busy=295% irq=90%
+  ndr-iter cpp_cpp_none_hmac rate=9375 offered=9360 sent=37440 recv=33441 loss=0.1068 server_cpu=75% client_cpu=68% sys_busy=284% irq=68%
+  ndr-iter cpp_cpp_none_hmac rate=8437 offered=8430 sent=33728 recv=33374 loss=0.0105 server_cpu=76% client_cpu=67% sys_busy=278% irq=76%
+NDR cpp_cpp_none_hmac | ndr_pps=8344 mbps=87 size=1300 | server_cpu=76% client_cpu=67% sys_busy=278% sys_irq=76% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.12s | warnlines=0 temp=76.0C
+  ndr-iter rust_rust_t2_none_hmac rate=60000 offered=24429 sent=97728 recv=33528 loss=0.6569 server_cpu=72% client_cpu=75% sys_busy=302% irq=98%
+  ndr-iter rust_rust_t2_none_hmac rate=30000 offered=22599 sent=90432 recv=37270 loss=0.5879 server_cpu=76% client_cpu=87% sys_busy=298% irq=101%
+  ndr-iter rust_rust_t2_none_hmac rate=15000 offered=14940 sent=59776 recv=39963 loss=0.3315 server_cpu=77% client_cpu=89% sys_busy=295% irq=97%
+  ndr-iter rust_rust_t2_none_hmac rate=7500 offered=7488 sent=29952 recv=29816 loss=0.0045 server_cpu=71% client_cpu=65% sys_busy=279% irq=79%
+  ndr-iter rust_rust_t2_none_hmac rate=11250 offered=11245 sent=44992 recv=44844 loss=0.0033 server_cpu=88% client_cpu=92% sys_busy=278% irq=78%
+  ndr-iter rust_rust_t2_none_hmac rate=13125 offered=13110 sent=52480 recv=43024 loss=0.1802 server_cpu=85% client_cpu=89% sys_busy=304% irq=86%
+  ndr-iter rust_rust_t2_none_hmac rate=12187 offered=12172 sent=48704 recv=38710 loss=0.2052 server_cpu=77% client_cpu=78% sys_busy=301% irq=89%
+NDR rust_rust_t2_none_hmac | ndr_pps=11211 mbps=117 size=1300 | server_cpu=88% client_cpu=92% sys_busy=278% sys_irq=78% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.15s | warnlines=0 temp=74.5C
+  ndr-iter cpp_cpp_xor_simple rate=60000 offered=29632 sent=118528 recv=34528 loss=0.7087 server_cpu=74% client_cpu=79% sys_busy=299% irq=96%
+  ndr-iter cpp_cpp_xor_simple rate=30000 offered=29420 sent=117696 recv=29864 loss=0.7463 server_cpu=71% client_cpu=80% sys_busy=289% irq=102%
+# restored rmem_max=16777216 wmem_max=16777216 governor=ondemand
+Terminated

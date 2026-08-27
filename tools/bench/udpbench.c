@@ -1,8 +1,11 @@
 // udpbench.c — low-overhead UDP traffic generator and sink (sendmmsg / recvmmsg), so the
 // load generator does not steal the CPU we are trying to measure.
 //
-//   udpbench blast <host> <port> <seconds> <size> [max_pps]
+//   udpbench blast <host> <port> <seconds> <size> [max_pps] [burst]
 //   udpbench sink  <bind_ip> <port> <seconds>
+//
+// `burst` (default 64, max 64) is the number of datagrams per sendmmsg call; with a rate
+// limit the generator sleeps between bursts, so smaller bursts mean smoother pacing.
 //
 // The sink prints one line per second ("t=<n> pps=<n>") and a final summary.
 // Build: gcc -O2 -o udpbench udpbench.c
@@ -56,6 +59,8 @@ static int blast(int argc, char **argv) {
     double seconds = atof(argv[4]);
     int size = atoi(argv[5]);
     long max_pps = argc > 6 ? atol(argv[6]) : 0;
+    int burst = argc > 7 ? atoi(argv[7]) : BATCH;
+    if (burst < 1 || burst > BATCH) burst = BATCH;
     struct sockaddr_storage ss;
     socklen_t slen;
     int fam = make_addr(host, port, &ss, &slen);
@@ -81,9 +86,9 @@ static int blast(int argc, char **argv) {
         if (t >= deadline) break;
         if (max_pps > 0) {
             long allowed = (long)((t - t0) * max_pps) - sent;
-            if (allowed < BATCH) { usleep(50); continue; }
+            if (allowed < burst) { usleep(50); continue; }
         }
-        int n = sendmmsg(fd, msgs, BATCH, 0);
+        int n = sendmmsg(fd, msgs, burst, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == ENOBUFS || errno == EINTR) { eagain++; usleep(100); continue; }
             perror("sendmmsg");
@@ -92,7 +97,7 @@ static int blast(int argc, char **argv) {
         sent += n;
     }
     double dur = now() - t0;
-    printf("blast: packets=%ld size=%d duration=%.2fs pps=%.0f mbps=%.1f enobufs=%ld\n", sent, size, dur, sent / dur, sent * (double)size * 8 / dur / 1e6, eagain);
+    printf("blast: packets=%ld size=%d burst=%d duration=%.2fs pps=%.0f mbps=%.1f enobufs=%ld\n", sent, size, burst, dur, sent / dur, sent * (double)size * 8 / dur / 1e6, eagain);
     return 0;
 }
 
@@ -150,6 +155,6 @@ static int sink(int argc, char **argv) {
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "blast") == 0) return blast(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "sink") == 0) return sink(argc, argv);
-    fprintf(stderr, "usage: udpbench blast <host> <port> <seconds> <size> [max_pps]\n       udpbench sink <bind_ip> <port> <seconds>\n");
+    fprintf(stderr, "usage: udpbench blast <host> <port> <seconds> <size> [max_pps] [burst]\n       udpbench sink <bind_ip> <port> <seconds>\n");
     return 2;
 }
