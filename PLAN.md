@@ -99,16 +99,11 @@ Threading model (the reason for the port):
 
 ## Known gaps / ideas (in rough priority order)
 
-* **Batch the worker handoff**: today every packet is one channel message + one eventfd
-  write (~1–2 µs). On a CPU with hardware AES the crypto itself costs about that much, so in
-  the Docker run `--threads 0` (226k pps) beat 4 threads (154k pps) while 3 threads gave
-  268k pps. Sending a `Vec<Job>` per worker per drain round (and one wake per batch) should
-  make the threaded mode a strict win. Expect the Pi 4 (software AES, ~20 µs/packet) to
-  benefit from threads today and the Pi 5 (hardware AES) to want `--threads 0/1` until this
-  is done — measure both.
-* **`recvmmsg`/`sendmmsg` batching** on the I/O thread (`net/raw.rs`, client/server
-  drain loops). The I/O thread is the next bottleneck once crypto is off it; batching
-  cuts syscalls ~8-30×. TPACKET_V3 ring for RX later.
+* ~~Batch the worker handoff~~ done (`77276c9`), plus the busy-poll fix (`8f1b17b`); see the
+  Docker benchmark section.
+* **`recvmmsg`/`sendmmsg` batching** on the I/O thread (`net/raw.rs`, client/server drain
+  loops) — now the measured bottleneck with two workers (I/O thread at 100 % around 265k
+  pps in the container); batching cuts syscalls ~8-30×. TPACKET_V3 ring for RX later.
 * **Buffer pooling**: jobs allocate `Vec<u8>` per packet; recycle through the completion
   path.
 * `Crypto::encrypt/decrypt` copy the input once; could work in place on the job buffer.
@@ -208,6 +203,49 @@ Caveats and next steps:
   capacities, not for a Pi 5.
 * `net.core.rmem_max` is 212992 on this box, so the daemons' requested 1 MB socket buffers
   are capped in production; consider raising it (or `--force-sock-buf`).
+
+## Docker 4-core benchmark and the threading fixes (2026-08-27)
+
+Long runs on the Pi disturb the router it lives on, so the threading study moved to the
+arm64 dev container on the Mac (`tools/docker/bench.sh`): daemons pinned to 4 cores
+(`taskset`), `--aes-backend table` to take the Pi 4's no-AES-instructions code path, the
+C++ reference built from the same checkout (portable-C AES), same no-drop-rate search.
+Cores are ~5× faster than an A72, so absolute numbers do not transfer; ratios do.
+
+Two defects found and fixed on the way (both also explain the flat threading results on the Pi):
+
+1. **I/O thread busy-polled while jobs were in flight** (`poll` timeout 0 whenever
+   `pipeline.in_flight() > 0`), burning a core that the workers needed. Completions already
+   wake the loop through the eventfd; the zero timeout is now used only for sockets whose
+   drain budget ran out. (`8f1b17b`)
+2. **Per-packet handoff**: one channel message + one eventfd write per packet. Jobs are now
+   handed over in batches of 16 (`pipeline.rs`, `77276c9`); ordering is unchanged.
+
+No-drop rate, 1300-byte datagrams (`docs/bench/docker-ndr-2026-08-27.txt`;
+`extra_*` = build before the two fixes):
+
+| case | shared: all on 4 cores | split: each daemon on its own 4 cores |
+|---|---:|---:|
+| C++ ↔ C++ | 81.8k pps | 85.9k pps |
+| Rust `--threads 0` (table AES) | 132k (1.62×) | 133k (1.55×) |
+| Rust `--threads 1` | 149k | 140k |
+| Rust `--threads 2` | 187k | **265k (3.1× C++, 2.0× threads 0)** |
+| Rust `--threads 3` | 200k (2.45×) | 250k |
+| Rust `--threads 0`, hardware AES | 208k | 205k |
+| Rust `--threads 2`, hardware AES | 222k | 294k |
+| before fixes, `--threads 2` (table) | 122k (slower than threads 0) | 259k |
+| before fixes, `--threads 2` (hw) | 152k | 286k |
+
+Reading: with the fixes, threads scale in both models; with its own cores a daemon doubles
+its single-threaded rate with two workers, after which **the I/O thread is the limit**
+(~100 % at 265k pps: one `recvfrom` + one `sendto` per packet plus header work). That is the
+next optimisation (`recvmmsg`/`sendmmsg`). On a CPU with hardware AES the crypto is cheap, so
+`--threads 0` is already 2.4× C++ and `--threads 2` adds another 1.4×.
+
+Guidance: Pi 4 as the only udp2raw daemon on the box → `--threads 2` (the default auto
+value); Pi 5 → `--threads 0` or `2`, measure; both ends on one small box → `--threads 1`.
+The Pi 4 loopback numbers above were taken **before** these fixes and under a kernel
+ceiling; re-measure there (briefly) with `--threads 2` when convenient.
 
 ## e2e run log
 

@@ -1,0 +1,14 @@
+# 2026-08-27T14:39:28+00:00 docker nproc=16 cpuset=0-3 hi=300000 secs=4
+# cpp=git version:fb13730ec1 build date:Aug 27 2026 14:39:25 rust=a317af6
+NDR cpp_cpp | ndr_pps=81816 mbps=851 size=1300 | server_cpu=95% client_cpu=91% sys_busy=174% sys_irq=19% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.02s | warnlines= temp=C
+NDR rust_t0_table | ndr_pps=132481 mbps=1378 size=1300 | server_cpu=94% client_cpu=100% sys_busy=188% sys_irq=15% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.02s | warnlines= temp=C
+NDR rust_t1_table | ndr_pps=160143 mbps=1665 size=1300 | server_cpu=172% client_cpu=199% sys_busy=377% sys_irq=14% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.02s | warnlines= temp=C
+NDR rust_t2_table | ndr_pps=106011 mbps=1103 size=1300 | server_cpu=128% client_cpu=131% sys_busy=248% sys_irq=13% (of 400%) | probe: sent=500 received=490 corrupt=0 size=1000 flows=2 ratio=0.9800 elapsed=5.02s | warnlines= temp=C
+NDR rust_t3_table | ndr_pps=129263 mbps=1344 size=1300 | server_cpu=138% client_cpu=155% sys_busy=289% sys_irq=12% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines= temp=C
+NDR rust_t0_hw | ndr_pps=209595 mbps=2180 size=1300 | server_cpu=95% client_cpu=100% sys_busy=191% sys_irq=26% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.02s | warnlines= temp=C
+NDR rust_t2_hw | ndr_pps=108384 mbps=1127 size=1300 | server_cpu=85% client_cpu=77% sys_busy=151% sys_irq=14% (of 400%) | probe: sent=500 received=498 corrupt=0 size=1000 flows=2 ratio=0.9960 elapsed=5.02s | warnlines= temp=C
+NDR extra_t0_table | ndr_pps=132002 mbps=1373 size=1300 | server_cpu=95% client_cpu=100% sys_busy=193% sys_irq=15% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.02s | warnlines= temp=C
+NDR extra_t2_table | ndr_pps=115214 mbps=1198 size=1300 | server_cpu=116% client_cpu=136% sys_busy=248% sys_irq=14% (of 400%) | probe: sent=500 received=405 corrupt=0 size=1000 flows=2 ratio=0.8100 elapsed=5.02s | warnlines= temp=C
+NDR extra_t3_table | ndr_pps=120089 mbps=1249 size=1300 | server_cpu=122% client_cpu=149% sys_busy=265% sys_irq=12% (of 400%) | probe: sent=500 received=462 corrupt=0 size=1000 flows=2 ratio=0.9240 elapsed=5.03s | warnlines= temp=C
+NDR extra_t2_hw | ndr_pps=145062 mbps=1509 size=1300 | server_cpu=96% client_cpu=115% sys_busy=207% sys_irq=17% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.02s | warnlines= temp=C
+# done 2026-08-27T14:49:45+00:00

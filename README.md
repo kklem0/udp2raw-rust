@@ -11,7 +11,9 @@ What is different from the C++ version:
   worker threads (default: auto, `cores - 2` capped at 4) while one I/O thread owns the
   sockets and all connection state. Completions are applied in submission order, so
   sequence numbers, anti-replay and FakeTCP seq/ack behave exactly as single-threaded.
-  `--threads 0` gives the old single-threaded behaviour.
+  `--threads 0` gives the old single-threaded behaviour. On a 4-core Pi 4 running only the
+  daemon, `--threads 2` (the auto default) doubles the single-threaded rate in the Docker
+  model; see PLAN.md for measurements.
 * **Hardware crypto without special builds.** AES uses the ARMv8 Cryptography Extensions
   (Raspberry Pi 5, most ARM servers) or AES-NI when the CPU has them, detected at runtime;
   SHA-1/SHA-2 likewise. CPUs without AES instructions (Raspberry Pi 4, Cortex-A72) get a
