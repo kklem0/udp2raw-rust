@@ -12,6 +12,7 @@ pub mod conv;
 pub mod crypto;
 pub mod logging;
 pub mod packet;
+pub mod selftest;
 pub mod types;
 pub mod util;
 pub mod wire;

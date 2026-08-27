@@ -7,11 +7,13 @@
 //! [`Crypto`] is immutable after construction and `Send + Sync`, so worker threads can
 //! share one instance behind an `Arc`.
 
+pub mod aead;
 pub mod aes_table;
 pub mod auth;
 pub mod cipher;
 pub mod kdf;
 
+pub use aead::Aead;
 pub use auth::{AuthMode, Authenticator};
 pub use cipher::{AesBackend, AesKey, CipherMode, cpu_has_aes, resolve_backend};
 
@@ -100,6 +102,8 @@ pub struct Crypto {
     ecb_dec: Option<AesKey>,
     tx_auth: Authenticator,
     rx_auth: Authenticator,
+    /// Set for the AEAD cipher mode; then the cipher/auth fields above are unused.
+    aead: Option<Aead>,
 }
 
 impl Crypto {
@@ -109,6 +113,9 @@ impl Crypto {
     }
 
     pub fn with_backend(cipher_mode: CipherMode, auth_mode: AuthMode, cfb_legacy: bool, keys: Keys, backend: AesBackend) -> Crypto {
+        // an AEAD mode carries its own tag; any requested auth mode is ignored
+        let auth_mode = if cipher_mode.is_aead() { AuthMode::None } else { auth_mode };
+        let aead = if cipher_mode.is_aead() { Some(Aead::new(&keys.cipher_key_encrypt, &keys.cipher_key_decrypt)) } else { None };
         let hmac = auth_mode == AuthMode::HmacSha1;
         let tx_key: [u8; 16] = if hmac {
             keys.cipher_key_encrypt[..16].try_into().unwrap()
@@ -145,6 +152,7 @@ impl Crypto {
             ecb_dec,
             tx_auth,
             rx_auth,
+            aead,
         }
     }
 
@@ -178,6 +186,9 @@ impl Crypto {
             log::warn!("len>max_data_len");
             return None;
         }
+        if let Some(a) = &self.aead {
+            return a.encrypt_vec(buf);
+        }
         if self.is_hmac_used() {
             self.cipher_encrypt(&mut buf)?;
             self.tx_auth.append_tag(&mut buf);
@@ -199,6 +210,9 @@ impl Crypto {
             log::warn!("len>max_data_len");
             return None;
         }
+        if let Some(a) = &self.aead {
+            return a.decrypt_vec(buf);
+        }
         if self.is_hmac_used() {
             let body_len = self.rx_auth.verify(&buf)?;
             buf.truncate(body_len);
@@ -214,7 +228,7 @@ impl Crypto {
 
     fn cipher_encrypt(&self, buf: &mut Vec<u8>) -> Option<()> {
         match self.cipher_mode {
-            CipherMode::None => {}
+            CipherMode::None | CipherMode::ChaCha20Poly1305 => {}
             CipherMode::Xor => xor_in_place(buf, &self.tx_xor_key),
             CipherMode::Aes128Cbc => {
                 pad16(buf);
@@ -238,7 +252,7 @@ impl Crypto {
 
     fn cipher_decrypt(&self, buf: &mut Vec<u8>) -> Option<()> {
         match self.cipher_mode {
-            CipherMode::None => {}
+            CipherMode::None | CipherMode::ChaCha20Poly1305 => {}
             CipherMode::Xor => xor_in_place(buf, &self.rx_xor_key),
             CipherMode::Aes128Cbc => {
                 if buf.len() % 16 != 0 {
@@ -284,7 +298,7 @@ impl Crypto {
     /// for AES modes.
     pub fn gro_obfuscate_head(&self, head: &mut [u8]) {
         match self.cipher_mode {
-            CipherMode::Xor => {
+            CipherMode::Xor | CipherMode::ChaCha20Poly1305 => {
                 head[0] ^= self.keys.gro_xor[0];
                 head[1] ^= self.keys.gro_xor[1];
             }
@@ -295,7 +309,7 @@ impl Crypto {
 
     pub fn gro_deobfuscate_head(&self, head: &mut [u8]) {
         match self.cipher_mode {
-            CipherMode::Xor => {
+            CipherMode::Xor | CipherMode::ChaCha20Poly1305 => {
                 head[0] ^= self.keys.gro_xor[0];
                 head[1] ^= self.keys.gro_xor[1];
             }
@@ -317,7 +331,7 @@ mod tests {
 
     #[test]
     fn roundtrip_every_mode_both_directions() {
-        let modes = [CipherMode::None, CipherMode::Xor, CipherMode::Aes128Cbc, CipherMode::Aes128Cfb];
+        let modes = [CipherMode::None, CipherMode::Xor, CipherMode::Aes128Cbc, CipherMode::Aes128Cfb, CipherMode::ChaCha20Poly1305];
         let auths = [AuthMode::None, AuthMode::Md5, AuthMode::Crc32, AuthMode::Simple, AuthMode::HmacSha1];
         for backend in [AesBackend::Auto, AesBackend::Table, AesBackend::Fixslice] {
         for cm in modes {
@@ -341,8 +355,8 @@ mod tests {
                     // and the other direction
                     let ct2 = s.encrypt(&msg).unwrap();
                     assert_eq!(c.decrypt(&ct2).unwrap(), msg);
-                    // only hmac_sha1 keys are direction-specific; the legacy modes share normal_key
-                    if am == AuthMode::HmacSha1 {
+                    // only hmac_sha1 and the AEAD keys are direction-specific; the legacy modes share normal_key
+                    if am == AuthMode::HmacSha1 || cm.is_aead() {
                         assert!(c.decrypt(&ct).is_none(), "wrong role accepted {cm:?} len={len}");
                     }
                 }

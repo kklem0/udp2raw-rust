@@ -182,7 +182,8 @@ usage:
 common options,these options must be same on both side:
     --raw-mode            <string>        available values:faketcp(default),udp,icmp and easy-faketcp
     -k,--key              <string>        password to gen symetric key,default:\"secret key\"
-    --cipher-mode         <string>        available values:aes128cfb,aes128cbc(default),xor,none
+    --cipher-mode         <string>        available values:aes128cfb,aes128cbc(default),xor,none,
+                                          chacha20poly1305 (udp2raw-rust only, both ends; AEAD, no --auth-mode)
     --auth-mode           <string>        available values:hmac_sha1,md5(default),crc32,simple,none
     -a,--auto-rule                        auto add (and delete) iptables rule
     -g,--gen-rule                         generate iptables rule then exit,so that you can copy and
@@ -373,6 +374,12 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
             disable_anti_replay = true;
         }
     }
+    if cipher_mode.is_aead() {
+        if cli.auth_mode.is_some() && auth_mode != AuthMode::None {
+            log::warn!("--auth-mode {} ignored: {} authenticates every packet itself", auth_mode.name(), cipher_mode.name());
+        }
+        auth_mode = AuthMode::None;
+    }
     let source_ip = match &cli.source_ip {
         Some(s) => Some(s.parse::<IpAddr>().map_err(|_| format!("ip_addr {s} is invalid"))?),
         None => None,
@@ -538,6 +545,15 @@ mod tests {
         assert_eq!(c.threads, 3);
         assert_eq!(c.socket_buf_size, 2048 * 1024);
         assert_eq!(c.seq_mode, 4);
+    }
+
+    #[test]
+    fn aead_mode_ignores_auth_mode_but_keeps_anti_replay() {
+        let out = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --auth-mode md5")).unwrap();
+        let ParseOutcome::Run(c) = out else { panic!() };
+        assert_eq!(c.cipher_mode, CipherMode::ChaCha20Poly1305);
+        assert_eq!(c.auth_mode, AuthMode::None);
+        assert!(!c.disable_anti_replay);
     }
 
     #[test]

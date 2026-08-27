@@ -11,10 +11,16 @@ fn main() {
             print!("{HELP_TEXT}");
             std::process::exit(0);
         }
-        Ok(ParseOutcome::UnitTest) => {
-            println!("unit tests live in the cargo test suite: run `cargo test`");
-            std::process::exit(0);
-        }
+        Ok(ParseOutcome::UnitTest) => match udp2raw::selftest::run() {
+            Ok(()) => {
+                println!("self-test passed");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("self-test FAILED: {e}");
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
             log::error!("{e}");
             print!("{HELP_TEXT}");

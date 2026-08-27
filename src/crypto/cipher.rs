@@ -79,6 +79,8 @@ pub enum CipherMode {
     Xor,
     Aes128Cbc,
     Aes128Cfb,
+    /// udp2raw-rust extension (not in the C++): ChaCha20-Poly1305 AEAD, see `crypto::aead`.
+    ChaCha20Poly1305,
 }
 
 impl CipherMode {
@@ -90,6 +92,7 @@ impl CipherMode {
             "aes128cbc" => Some((CipherMode::Aes128Cbc, false)),
             "aes128cfb" => Some((CipherMode::Aes128Cfb, false)),
             "aes128cfb_0" => Some((CipherMode::Aes128Cfb, true)),
+            "chacha20poly1305" | "chacha" => Some((CipherMode::ChaCha20Poly1305, false)),
             _ => None,
         }
     }
@@ -100,11 +103,17 @@ impl CipherMode {
             CipherMode::Xor => "xor",
             CipherMode::Aes128Cbc => "aes128cbc",
             CipherMode::Aes128Cfb => "aes128cfb",
+            CipherMode::ChaCha20Poly1305 => "chacha20poly1305",
         }
     }
 
     pub fn is_aes(self) -> bool {
         matches!(self, CipherMode::Aes128Cbc | CipherMode::Aes128Cfb)
+    }
+
+    /// The mode authenticates by itself (`--auth-mode` is ignored).
+    pub fn is_aead(self) -> bool {
+        matches!(self, CipherMode::ChaCha20Poly1305)
     }
 }
 

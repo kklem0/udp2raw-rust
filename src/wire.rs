@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn gro_wrap_unwrap_merged_burst() {
-        for cm in [CipherMode::Aes128Cbc, CipherMode::Xor, CipherMode::None, CipherMode::Aes128Cfb] {
+        for cm in [CipherMode::Aes128Cbc, CipherMode::Xor, CipherMode::None, CipherMode::Aes128Cfb, CipherMode::ChaCha20Poly1305] {
             let c = Crypto::new(cm, AuthMode::Md5, false, Keys::derive("k", true));
             let s = Crypto::new(cm, AuthMode::Md5, false, Keys::derive("k", false));
             let pkts: Vec<Vec<u8>> = (0..3)
