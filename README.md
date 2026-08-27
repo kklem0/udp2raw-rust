@@ -54,7 +54,43 @@ sudo ./udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:51820 -k "passwd" --raw-mode fake
 sudo ./udp2raw -c -l 127.0.0.1:3333 -r 44.55.66.77:4096 -k "passwd" --raw-mode faketcp -a
 ```
 
-Performance notes for the Raspberry Pi are in [PLAN.md](PLAN.md).
+## Performance
+
+Loss-free throughput ("no-drop rate": highest offered rate with ≤2 % loss, RFC 2544 style),
+1300-byte datagrams, `faketcp` + `aes128cbc` + `md5` + `--fix-gro` (the udp2raw defaults),
+client and server of the same implementation, UDP in one direction through both daemons.
+C++ = stock udp2raw `fb13730`; Rust = this repo. Raw logs and method: `docs/bench/`,
+[PLAN.md](PLAN.md).
+
+**Raspberry Pi 4** (Cortex-A72 ×4 @1.8 GHz, no AES instructions, Ubuntu 24.04), both daemons
+on the Pi over loopback, 2026-08-27:
+
+| | loss-free pps | Mbit/s | server / client CPU | vs C++ |
+|---|---:|---:|---|---:|
+| C++ | 10,220 | 106 | 98 % / 87 % | 1.00× |
+| Rust `--threads 0` | 14,784 | 154 | 91 % / 97 % | 1.45× |
+| Rust `--threads 2` | 18,720 | 195 | 130 % / 135 % | 1.83× |
+
+Both ends share the Pi's four cores here, which limits what the workers can add; the C++
+figure varied between 4.7k and 10.2k across runs (it drops packets under bursts before it is
+CPU-bound), the Rust figures were stable.
+
+**Docker, arm64, daemons pinned to 4 cores each** (fast cores, so only the ratios matter;
+`--aes-backend table` forces the Pi 4's software-AES code path):
+
+| | both ends on one 4-core box | one daemon per 4-core box |
+|---|---:|---:|
+| C++ | 82k pps | 86k pps |
+| Rust `--threads 0` | 132k (1.6×) | 133k (1.6×) |
+| Rust `--threads 2` | 187k (2.3×) | **265k (3.1×)** |
+| Rust `--threads 0`, hardware AES (Pi 5 class) | 208k | 205k |
+| Rust `--threads 2`, hardware AES | 222k | 294k |
+
+Where the difference comes from: table-driven AES instead of a bitsliced fallback on CPUs
+without AES instructions, batched socket drains (the C++ handles one packet per event-loop
+iteration and loses packets under bursts), and crypto on worker threads with batched
+handoff. With two workers the I/O thread's syscalls become the limit
+(`recvmmsg`/`sendmmsg` is the next step).
 
 ## Tests
 
