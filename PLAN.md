@@ -19,7 +19,8 @@ how to test on the Pis. Keep the **Status** section current.
 | Client state machine (faketcp / udp / icmp / easy-faketcp, reconnect, fifo) | done |
 | Server (many clients, conv sockets, connection recovery, GC) | done |
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
-| iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
+| iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done (per-endpoint rules for a hostname `-r`) |
+| Hostname client `-r` + in-process relay switching (`--dns-server`, `--underlay-dev`, netlink `/32` routes, endpoint cache) | done on `feat/dns-endpoint-reresolve` — unit + namespace integration tests |
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
 | Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below; Pi 5 and a two-box measurement still to do |
 | **Production on the Pi 4** (`udp2raw-wutong.service`, faketcp client to the VPS, WireGuard inside) | **`0e0b3fa` deployed 2026-08-28 01:28** (`/opt/udp2raw-rust-0e0b3fa-arm64`, unchanged conf, `--syscalls auto` → single); replaced `60a36d6`. See "Deployment" below |

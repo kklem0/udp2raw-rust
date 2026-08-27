@@ -20,6 +20,9 @@ What is different from the C++ version:
   table-driven AES like the C++ version's — the `aes` crate's constant-time bitsliced
   fallback is 2–4× slower for udp2raw's serial CBC encryption. `--aes-backend
   auto|hw|table|fixslice` overrides the choice.
+* **Hostname relay endpoints with in-process switching.** A client `-r host:port` is
+  re-resolved through explicit `--dns-server`s at every reconnect; a new address is adopted
+  without changing the process, the local listener or WireGuard. See "Hostname endpoints".
 * **Linux only.** Windows/macOS (the `udp2raw-multiplatform` pcap build) is not ported.
 * No per-packet `/dev/urandom` reads, no per-packet heap churn in the hot path, and the
   code is memory-safe — it runs as root / with `CAP_NET_RAW` and parses untrusted packets.
@@ -70,6 +73,73 @@ sudo ./udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:51820 -k "passwd" --raw-mode fake
 # client
 sudo ./udp2raw -c -l 127.0.0.1:3333 -r 44.55.66.77:4096 -k "passwd" --raw-mode faketcp -a
 ```
+
+### Hostname endpoints (client `-r`, in-process relay switching)
+
+A client `-r` may be a hostname. The client resolves it through the DNS servers you give
+with `--dns-server` (never `/etc/resolv.conf`, never `dig`), keeps the connection while it
+is healthy, and when it fails and the client reconnects it re-resolves and, if DNS now
+returns a different address, switches to it **in the same process** — the udp2raw PID, the
+local UDP listener and everything above it (e.g. WireGuard) are untouched. This lets you
+move a relay by changing one DNS record instead of restarting the tunnel.
+
+New client options:
+
+| option | meaning |
+|---|---|
+| `-r host:port` | resolve `host` (IPv4 `A` records) instead of a literal address; a literal `-r ip:port` is unchanged. Server `-r` stays numeric. |
+| `--dns-server ip[:port]` | resolver to use (default port 53); repeat to add more, tried in order, first usable answer wins. Required with a hostname `-r`. |
+| `--dns-timeout ms` | per-server timeout (default 2000). |
+| `--underlay-dev dev` | native interface for DNS **and** relay traffic: `SO_BINDTODEVICE` on the sockets plus a `/32` host route per relay address, so the lookup and the tunnel take the real link even when the default route is a VPN. Implies `--dev` when `--dev` is unset. |
+| `--underlay-gateway ip` | next hop on `--underlay-dev` for those routes; by default it is learned from the box's existing route to the bootstrap address (on-link if none). |
+| `--allow-private-endpoint` | accept RFC 1918 / CGNAT answers (rejected by default, along with loopback, link-local, multicast, broadcast, reserved and documentation ranges). |
+| `--endpoint-cache path` | file holding the last address whose handshake succeeded (default `/var/lib/udp2raw/endpoint_<host>_<port>`, mode 0600; `none` disables). Used to bootstrap before DNS answers. |
+| `--bootstrap-addr ip` | literal to start with when DNS **and** the cache are both unavailable at startup. |
+
+How it behaves: a DNS answer is only a *candidate* — an address becomes "last-known-good"
+(and is written to the cache) only after the udp2raw authenticated handshake succeeds on it,
+so a poisoned answer cannot redirect the tunnel (the relay still has to prove the key). The
+current address is always tried first and answer order is ignored, so a reordered or
+duplicated answer never causes a switch; a genuinely new address is adopted at the next
+reconnect boundary. Failed queries back off exponentially with jitter, and NXDOMAIN /
+SERVFAIL / timeout / malformed replies / a lost resolver never erase the current endpoint.
+`echo reconnect > <fifo>` forces a fresh query for a planned cutover without restarting.
+TTL is clamped to 10–3600 s; a healthy session is never interrupted by TTL expiry.
+
+**DNS record recommendation:** publish exactly **one** unproxied IPv4 `A` record with a
+**30–60 second TTL**. Keep it a plain A record (no CDN/proxy in front — the tunnel must reach
+the relay's real address), and change the single address to rotate.
+
+**Karsen and Wutong** (mainland client, AliDNS resolvers, `eth0` as the native underlay):
+
+```sh
+sudo ./udp2raw -c -l 127.0.0.1:7000 -r hk1b-udp2raw.clement.hk:8443 -k "passwd"     --raw-mode faketcp -a --fix-gro     --dns-server 223.5.5.5:53     --dns-server 223.6.6.6:53     --underlay-dev eth0
+```
+
+The `223.5.5.5` / `223.6.6.6` queries and the tunnel both leave through `eth0`, and the
+client installs a `/32` route for each resolved relay address over `eth0` — so a newly
+resolved address works even though the box keeps no `/32` escape route for it in advance
+(the `wutong_direct` policy table's default via the LAN gateway still applies, but the
+explicit `/32` guarantees it regardless of what the default route is doing).
+
+**Rotation workflow (zero-touch cutover):**
+
+1. Prepare the new relay first: bring up the new EIP / listener / firewall and confirm it
+   serves the same key and mode.
+2. Update the DNS `A` record to the new address.
+3. Keep the **old** EIP running through the TTL grace period (30–60 s) so in-flight sessions
+   are not cut.
+4. Either force the cutover now with `echo reconnect > <fifo>` (re-resolves immediately), or
+   wait for the client's own failure detection when you retire the old EIP. The switch is
+   in-process; WireGuard above it never notices beyond a brief reconnect.
+5. Retire the old EIP once the client has moved (its log shows `relay is now <new> …` and
+   `<new> is now last-known-good`).
+
+**Rollback / break-glass:** point the DNS record back to the previous address and
+`echo reconnect > <fifo>`. If DNS itself is the problem, start the client with a literal
+`-r <ip>:<port>` (no `--dns-server`) — identical to classic udp2raw, no resolution at all —
+or rely on the cached last-known-good address and `--bootstrap-addr` which keep the service
+usable through a startup-time DNS outage.
 
 ## Performance
 
