@@ -247,6 +247,24 @@ value); Pi 5 → `--threads 0` or `2`, measure; both ends on one small box → `
 The Pi 4 loopback numbers above were taken **before** these fixes and under a kernel
 ceiling; re-measure there (briefly) with `--threads 2` when convenient.
 
+## Raspberry Pi 4, quick re-run with the final build (2026-08-27, 88 s)
+
+Same loopback setup as the long run, final binary (`60a36d6`: table AES, batched handoff,
+no busy-poll), 5 search steps of 2 s (`docs/bench/pi4-quick-2026-08-27.txt`):
+
+| case | no-drop pps | Mbit/s | server / client CPU | vs C++ |
+|---|---:|---:|---|---:|
+| C++ ↔ C++ | 10,220 | 106 | 98 % / 87 % | 1.00× |
+| Rust `--threads 0` | 14,784 | 154 | 91 % / 97 % | 1.45× |
+| Rust `--threads 2` | 18,720 | 195 | 130 % / 135 % | 1.83× |
+
+Notes: the C++ reached 10.2k this time (4.7k in the long run) — its loss under bursts is
+erratic between runs, so treat its number as 5–10k; the Rust numbers were stable across
+steps. Both ends share the 4 cores here (3 threads each with `--threads 2`, plus the
+generator), which is why the threaded gain (1.27× over single-threaded) is smaller than the
+2.0× seen with one daemon per 4-core box in Docker — the deployment case still needs a
+two-box measurement.
+
 ## e2e run log
 
 ### 2026-08-27 — Docker Desktop (Apple Silicon), `rust:1-bookworm` arm64, loopback
