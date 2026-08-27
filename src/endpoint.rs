@@ -333,7 +333,6 @@ impl EndpointController {
         self.queries += 1;
         match self.resolver.resolve_a(&name) {
             Ok(ans) => {
-                self.backoff.on_success();
                 self.expires_at_ms = Some(now_ms + u64::from(ans.ttl) * 1000);
                 let mut safe = Vec::new();
                 for ip in &ans.addrs {
@@ -357,9 +356,14 @@ impl EndpointController {
                     safe
                 );
                 if safe.is_empty() {
-                    log::warn!("endpoint: dns answer for {name} had no usable address; keeping the previous candidates");
+                    // A reply we could read but with no usable address (all filtered out, or a
+                    // NODATA-shaped positive): rate-limit it like a failure so a resolver that
+                    // only ever returns rejected addresses cannot drive a per-cycle query loop.
+                    let delay = self.backoff.on_failure(now_ms);
+                    log::warn!("endpoint: dns answer for {name} had no usable address; keeping the previous candidates, next query in {:.1}s", delay as f64 / 1000.0);
                     return false;
                 }
+                self.backoff.on_success();
                 if safe != self.candidates_unordered() {
                     log::info!("endpoint: candidates for {name} changed: {:?} -> {:?}", self.candidates, safe);
                 }
@@ -661,6 +665,24 @@ mod tests {
         let mut c = EndpointController::bootstrap(host(), m, opts(), 0).unwrap();
         assert!(c.on_cycle(11_000, CycleReason::AttemptFailed).is_none());
         assert_eq!(c.candidates(), &[ip("47.243.1.1")]);
+    }
+
+    #[test]
+    fn persistent_unsafe_answers_do_not_loop() {
+        // DNS keeps returning only loopback while we run on a --bootstrap-addr: candidates stay
+        // empty, but the queries must be backoff-limited, not one per reconnect cycle.
+        let m = Mock::new(vec![Ok(vec![ip("127.0.0.1")])], 30);
+        let o = EndpointOptions { bootstrap: Some(ip("47.243.1.1")), ..opts() };
+        let mut c = EndpointController::bootstrap(host(), m, o, 0).unwrap();
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+        assert!(c.candidates().is_empty());
+        let mut t = 0;
+        while t < 600_000 {
+            t += 5_000;
+            assert!(c.on_cycle(t, CycleReason::AttemptFailed).is_none());
+        }
+        assert!(c.queries() >= 8 && c.queries() <= 20, "queries {}", c.queries());
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
     }
 
     #[test]
