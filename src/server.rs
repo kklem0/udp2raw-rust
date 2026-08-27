@@ -8,10 +8,10 @@ use crate::conv::ConvManager;
 use crate::crypto::Crypto;
 use crate::faketcp::{RawCtx, RawInfo, RecvMeta};
 use crate::fifo;
-use crate::net::{self, addr, raw::RawSockets};
+use crate::net::{self, addr, raw::RawSockets, RecvBatch};
 use crate::pipeline::{Done, Job, JobKey, Pipeline};
 use crate::types::RawMode;
-use crate::util::{now_ms, secure_random_u32_nz};
+use crate::util::{now_ms, secure_random_u32_nz, BufPool};
 use crate::wire;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
@@ -69,8 +69,9 @@ struct Server {
     const_id: u32,
     manual_ll: Option<libc::sockaddr_ll>,
     _bind_fd: RawFd,
-    recv_buf: Vec<u8>,
-    udp_buf: Vec<u8>,
+    raw_batch: RecvBatch<libc::sockaddr_ll>,
+    udp_batch: RecvBatch<libc::sockaddr_storage>,
+    pool: BufPool,
     hb_buf: Vec<u8>,
     exit_flag: &'static AtomicBool,
     /// Edge-triggered sources that still had data when the per-round budget ran out.
@@ -81,6 +82,8 @@ struct Server {
 /// Packets taken from one socket per event-loop round before the other sockets, the
 /// pipeline completions and the timer get a turn (bounds latency and memory under overload).
 const DRAIN_BUDGET: usize = 64;
+/// Datagrams per `recvmmsg`.
+const RX_BATCH: usize = 32;
 
 pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static AtomicBool) -> io::Result<()> {
     let sockets = RawSockets::open(&cfg)?;
@@ -130,8 +133,9 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
         const_id,
         manual_ll,
         _bind_fd: bind_fd,
-        recv_buf: vec![0u8; HUGE_BUF_LEN],
-        udp_buf: vec![0u8; BUF_LEN],
+        raw_batch: RecvBatch::new(RX_BATCH, HUGE_DATA_LEN + 1),
+        udp_batch: RecvBatch::new(RX_BATCH, MAX_DATA_LEN + 1),
+        pool: BufPool::new(2048, 4096),
         hb_buf,
         exit_flag,
         raw_pending: false,
@@ -220,6 +224,7 @@ impl Server {
                 self.on_timer();
                 self.collect();
             }
+            self.ctx.flush_tx();
         }
     }
 
@@ -272,10 +277,6 @@ impl Server {
         self.free_conns.push(slot);
     }
 
-    fn key(&self, slot: usize) -> JobKey {
-        JobKey { slot, generation: self.conns[slot].as_ref().map_or(0, |c| c.generation) }
-    }
-
     fn fill_lower_level(&self, raw: &mut RawInfo) {
         if !self.ctx.lower_level {
             return;
@@ -290,29 +291,33 @@ impl Server {
 
     /// Returns true if the socket may still hold data (budget exhausted).
     fn on_raw_readable(&mut self) -> bool {
-        for _ in 0..DRAIN_BUDGET {
-            let mut buf = std::mem::take(&mut self.recv_buf);
-            let r = self.ctx.sockets.recv(&mut buf[..HUGE_DATA_LEN + 1]);
-            match r {
-                Ok(Some((len, ll))) => {
-                    self.on_raw_packet(&mut buf, len, &ll);
-                    self.recv_buf = buf;
-                }
-                Ok(None) => {
-                    self.recv_buf = buf;
-                    return false;
-                }
+        let mut rounds = 0;
+        loop {
+            let mut b = std::mem::take(&mut self.raw_batch);
+            let n = match self.ctx.sockets.recv_batch(&mut b) {
+                Ok(n) => n,
                 Err(e) => {
                     log::debug!("raw recv error: {e}");
-                    self.recv_buf = buf;
-                    return false;
+                    0
                 }
+            };
+            for i in 0..n {
+                let len = b.lens[i];
+                self.on_raw_packet(&b.bufs[i], len, &b.addrs[i]);
+            }
+            let cap = b.capacity();
+            self.raw_batch = b;
+            rounds += 1;
+            if n < cap {
+                return false;
+            }
+            if rounds * cap >= DRAIN_BUDGET {
+                return true;
             }
         }
-        true
     }
 
-    fn on_raw_packet(&mut self, buf: &mut [u8], mut len: usize, ll: &libc::sockaddr_ll) {
+    fn on_raw_packet(&mut self, buf: &[u8], mut len: usize, ll: &libc::sockaddr_ll) {
         if len == HUGE_DATA_LEN + 1 {
             if !self.cfg.fix_gro {
                 log::warn!("huge packet, data_len {len} > {HUGE_DATA_LEN},dropped");
@@ -430,8 +435,9 @@ impl Server {
                 let c = self.conns[slot].as_mut().unwrap();
                 let Some(data) = self.ctx.parse_recv(&mut c.info.raw, buf, ll) else { return };
                 let meta = RecvMeta::from_recv(&c.info.raw.recv_info);
-                let wire_bytes = data.to_vec();
-                let key = self.key(slot);
+                let key = JobKey { slot, generation: c.generation };
+                let mut wire_bytes = self.pool.take();
+                wire_bytes.extend_from_slice(data);
                 self.pipeline.submit(Job::Decrypt { key, wire: wire_bytes, meta });
             }
             State::Idle => {}
@@ -549,9 +555,11 @@ impl Server {
     }
 
     fn send_heartbeat(&mut self, slot: usize) {
+        let mut plain = self.pool.take();
         let hb: &[u8] = if self.cfg.hb_mode == 0 { &[] } else { &self.hb_buf };
-        let plain = conn::prepare_safer(&mut self.conns[slot].as_mut().unwrap().info, TYPE_HEARTBEAT, hb);
-        let key = self.key(slot);
+        let c = self.conns[slot].as_mut().unwrap();
+        conn::prepare_safer_into(&mut c.info, TYPE_HEARTBEAT, hb, &mut plain);
+        let key = JobKey { slot, generation: c.generation };
         self.pipeline.submit(Job::Encrypt { key, plain });
     }
 
@@ -567,18 +575,20 @@ impl Server {
     fn on_done(&mut self, d: Done) {
         match d {
             Done::Encrypted { key, wire } => {
-                if !self.valid_ready(key) {
-                    return;
-                }
-                if let Some(w) = wire {
+                let Some(w) = wire else { return };
+                if self.valid_ready(key) {
                     let c = self.conns[key.slot].as_mut().unwrap();
                     if let Err(e) = conn::transmit_safer(&mut self.ctx, &mut c.info.raw, &w) {
                         log::trace!("send failed: {e}");
                     }
                 }
+                self.pool.recycle(w);
             }
             Done::Decrypted { key, plains, meta } => {
                 if !self.valid_ready(key) {
+                    for p in plains {
+                        self.pool.recycle(p);
+                    }
                     return;
                 }
                 if plains.is_empty() {
@@ -588,9 +598,13 @@ impl Server {
                 let mut any = false;
                 for p in plains {
                     let c = self.conns[key.slot].as_mut().unwrap();
-                    if let Some((ptype, payload)) = conn::accept_safer(&mut c.info, &p, self.cfg.hb_mode) {
-                        any = true;
-                        self.on_ready_packet(key.slot, ptype, &payload);
+                    match conn::accept_safer_offset(&mut c.info, &p, self.cfg.hb_mode) {
+                        Some((ptype, off)) => {
+                            any = true;
+                            self.on_ready_packet(key.slot, ptype, &p[off..]);
+                            self.pool.recycle(p);
+                        }
+                        None => self.pool.recycle(p),
                     }
                 }
                 if any {
@@ -660,27 +674,32 @@ impl Server {
 
     /// Returns true if the socket may still hold data (budget exhausted).
     fn on_sock_readable(&mut self, sidx: usize) -> bool {
-        for _ in 0..DRAIN_BUDGET {
+        let mut rounds = 0;
+        loop {
             let Some(cs) = self.socks[sidx].as_ref() else { return false };
-            let (conn_slot, conv) = (cs.conn_slot, cs.conv);
-            let mut buf = std::mem::take(&mut self.udp_buf);
-            let r = cs.sock.recv(&mut buf[..MAX_DATA_LEN + 1]);
-            let n = match r {
+            let (fd, conn_slot, conv) = (cs.sock.as_raw_fd(), cs.conn_slot, cs.conv);
+            let mut b = std::mem::take(&mut self.udp_batch);
+            let n = match b.recv(fd) {
                 Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.udp_buf = buf;
-                    return false;
-                }
                 Err(e) => {
                     log::debug!("udp fd,recv_len<0 continue,{e}");
-                    self.udp_buf = buf;
-                    return false;
+                    0
                 }
             };
-            self.on_sock_packet(conn_slot, conv, &buf[..n]);
-            self.udp_buf = buf;
+            for i in 0..n {
+                let len = b.lens[i];
+                self.on_sock_packet(conn_slot, conv, &b.bufs[i][..len]);
+            }
+            let cap = b.capacity();
+            self.udp_batch = b;
+            rounds += 1;
+            if n < cap {
+                return false;
+            }
+            if rounds * cap >= DRAIN_BUDGET {
+                return true;
+            }
         }
-        true
     }
 
     fn on_sock_packet(&mut self, slot: usize, conv: u32, data: &[u8]) {
@@ -691,14 +710,14 @@ impl Server {
         if data.len() >= self.cfg.mtu_warn {
             log::warn!("huge packet,data len={} (>={}).strongly suggested to set a smaller mtu at upper level,to get rid of this warn", data.len(), self.cfg.mtu_warn);
         }
+        let mut plain = self.pool.take();
         let Some(c) = self.conns[slot].as_mut() else { return };
         if c.state != State::Ready {
             log::error!("conn state is not server_ready, this shouldnt happen");
             return;
         }
-        let payload = wire::build_data_payload(conv, data);
-        let plain = conn::prepare_safer(&mut c.info, TYPE_DATA, &payload);
-        let key = self.key(slot);
+        conn::prepare_safer_data_into(&mut c.info, conv, data, &mut plain);
+        let key = JobKey { slot, generation: c.generation };
         self.pipeline.submit(Job::Encrypt { key, plain });
     }
 

@@ -8,10 +8,10 @@ use crate::conv::ConvManager;
 use crate::crypto::Crypto;
 use crate::faketcp::{RawCtx, RecvMeta};
 use crate::fifo;
-use crate::net::{self, addr, raw::RawSockets};
+use crate::net::{self, addr, raw::RawSockets, send_batch, RecvBatch, SendScratch, TxDst, TxPacket};
 use crate::pipeline::{Done, Job, JobKey, Pipeline};
 use crate::types::RawMode;
-use crate::util::{now_ms, secure_random_u32, secure_random_u32_nz};
+use crate::util::{now_ms, secure_random_u32, secure_random_u32_nz, BufPool};
 use crate::wire;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
@@ -51,8 +51,12 @@ struct Client {
     fail_time_counter: u32,
     /// Bumped whenever the connection restarts; in-flight pipeline jobs from before are ignored.
     generation: u64,
-    recv_buf: Vec<u8>,
-    udp_buf: Vec<u8>,
+    raw_batch: RecvBatch<libc::sockaddr_ll>,
+    udp_batch: RecvBatch<libc::sockaddr_storage>,
+    /// Decrypted datagrams for local peers, sent with one `sendmmsg` per round.
+    udp_tx: Vec<TxPacket>,
+    udp_scratch: SendScratch,
+    pool: BufPool,
     hb_buf: Vec<u8>,
     exit_flag: &'static AtomicBool,
     /// Edge-triggered sources that still had data when the per-round budget ran out.
@@ -63,6 +67,8 @@ struct Client {
 /// Packets taken from one socket per event-loop round before giving the other sockets,
 /// the pipeline completions and the timer a turn (bounds latency and memory under overload).
 const DRAIN_BUDGET: usize = 64;
+/// Datagrams per `recvmmsg`.
+const RX_BATCH: usize = 32;
 
 pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static AtomicBool) -> io::Result<()> {
     let sockets = RawSockets::open(&cfg)?;
@@ -124,8 +130,11 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
         const_id,
         fail_time_counter: 0,
         generation: 1,
-        recv_buf: vec![0u8; HUGE_BUF_LEN],
-        udp_buf: vec![0u8; BUF_LEN],
+        raw_batch: RecvBatch::new(RX_BATCH, HUGE_DATA_LEN + 1),
+        udp_batch: RecvBatch::new(RX_BATCH, MAX_DATA_LEN + 1),
+        udp_tx: Vec::with_capacity(64),
+        udp_scratch: SendScratch::default(),
+        pool: BufPool::new(2048, 2048),
         hb_buf,
         exit_flag,
         udp_pending: false,
@@ -202,6 +211,22 @@ impl Client {
                 self.on_timer();
                 self.collect();
             }
+            self.ctx.flush_tx();
+            self.flush_udp_tx();
+        }
+    }
+
+    fn flush_udp_tx(&mut self) {
+        if self.udp_tx.is_empty() {
+            return;
+        }
+        let n = self.udp_tx.len();
+        let accepted = send_batch(self.udp.as_raw_fd(), &self.udp_tx, &mut self.udp_scratch);
+        if accepted < n {
+            log::debug!("udp send: {} of {} datagrams not accepted", n - accepted, n);
+        }
+        for p in self.udp_tx.drain(..) {
+            self.pool.recycle(p.buf);
         }
     }
 
@@ -229,28 +254,32 @@ impl Client {
 
     /// Returns true if the socket may still hold data (budget exhausted).
     fn on_udp_readable(&mut self) -> bool {
-        for _ in 0..DRAIN_BUDGET {
-            let mut buf = std::mem::take(&mut self.udp_buf);
-            let r = self.udp.recv_from(&mut buf[..MAX_DATA_LEN + 1]);
-            let res = match r {
-                Ok((n, peer)) => Some((n, peer)),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => Some((usize::MAX, self.cfg.local_addr)),
+        let mut rounds = 0;
+        loop {
+            let mut b = std::mem::take(&mut self.udp_batch);
+            let n = match b.recv(self.udp.as_raw_fd()) {
+                Ok(n) => n,
                 Err(e) => {
                     log::debug!("recv_from error,{e}");
-                    None
+                    0
                 }
             };
-            let Some((n, peer)) = res else {
-                self.udp_buf = buf;
-                return false;
-            };
-            if n != usize::MAX {
-                self.on_udp_packet(&buf[..n], peer);
+            for i in 0..n {
+                let len = b.lens[i];
+                if let Some(peer) = addr::from_sockaddr(&b.addrs[i]) {
+                    self.on_udp_packet(&b.bufs[i][..len], peer);
+                }
             }
-            self.udp_buf = buf;
+            let cap = b.capacity();
+            self.udp_batch = b;
+            rounds += 1;
+            if n < cap {
+                return false;
+            }
+            if rounds * cap >= DRAIN_BUDGET {
+                return true;
+            }
         }
-        true
     }
 
     fn on_udp_packet(&mut self, data: &[u8], peer: SocketAddr) {
@@ -277,9 +306,10 @@ impl Client {
         };
         self.convs.update_active_time(conv, now);
         if self.state == State::Ready {
-            let payload = wire::build_data_payload(conv, data);
-            let plain = conn::prepare_safer(&mut self.info, TYPE_DATA, &payload);
-            self.pipeline.submit(Job::Encrypt { key: self.key(), plain });
+            let mut plain = self.pool.take();
+            conn::prepare_safer_data_into(&mut self.info, conv, data, &mut plain);
+            let key = self.key();
+            self.pipeline.submit(Job::Encrypt { key, plain });
         }
     }
 
@@ -287,29 +317,33 @@ impl Client {
 
     /// Returns true if the socket may still hold data (budget exhausted).
     fn on_raw_readable(&mut self) -> bool {
-        for _ in 0..DRAIN_BUDGET {
-            let mut buf = std::mem::take(&mut self.recv_buf);
-            let r = self.ctx.sockets.recv(&mut buf[..HUGE_DATA_LEN + 1]);
-            match r {
-                Ok(Some((len, ll))) => {
-                    self.on_raw_packet(&mut buf, len, &ll);
-                    self.recv_buf = buf;
-                }
-                Ok(None) => {
-                    self.recv_buf = buf;
-                    return false;
-                }
+        let mut rounds = 0;
+        loop {
+            let mut b = std::mem::take(&mut self.raw_batch);
+            let n = match self.ctx.sockets.recv_batch(&mut b) {
+                Ok(n) => n,
                 Err(e) => {
                     log::debug!("raw recv error: {e}");
-                    self.recv_buf = buf;
-                    return false;
+                    0
                 }
+            };
+            for i in 0..n {
+                let len = b.lens[i];
+                self.on_raw_packet(&b.bufs[i], len, &b.addrs[i]);
+            }
+            let cap = b.capacity();
+            self.raw_batch = b;
+            rounds += 1;
+            if n < cap {
+                return false;
+            }
+            if rounds * cap >= DRAIN_BUDGET {
+                return true;
             }
         }
-        true
     }
 
-    fn on_raw_packet(&mut self, buf: &mut [u8], mut len: usize, ll: &libc::sockaddr_ll) {
+    fn on_raw_packet(&mut self, buf: &[u8], mut len: usize, ll: &libc::sockaddr_ll) {
         if len == HUGE_DATA_LEN + 1 {
             if !self.cfg.fix_gro {
                 log::warn!("huge packet, data_len {len} > {HUGE_DATA_LEN},dropped");
@@ -400,8 +434,10 @@ impl Client {
                     return;
                 }
                 let meta = RecvMeta::from_recv(&r);
-                let wire_bytes = data.to_vec();
-                self.pipeline.submit(Job::Decrypt { key: self.key(), wire: wire_bytes, meta });
+                let mut wire_bytes = self.pool.take();
+                wire_bytes.extend_from_slice(data);
+                let key = self.key();
+                self.pipeline.submit(Job::Decrypt { key, wire: wire_bytes, meta });
             }
         }
     }
@@ -411,17 +447,19 @@ impl Client {
     fn on_done(&mut self, d: Done) {
         match d {
             Done::Encrypted { key, wire } => {
-                if key.generation != self.generation || self.state != State::Ready {
-                    return;
-                }
-                if let Some(w) = wire {
+                let Some(w) = wire else { return };
+                if key.generation == self.generation && self.state == State::Ready {
                     if let Err(e) = conn::transmit_safer(&mut self.ctx, &mut self.info.raw, &w) {
                         log::trace!("send failed: {e}");
                     }
                 }
+                self.pool.recycle(w);
             }
             Done::Decrypted { key, plains, meta } => {
                 if key.generation != self.generation || !matches!(self.state, State::Handshake2 | State::Ready) {
+                    for p in plains {
+                        self.pool.recycle(p);
+                    }
                     return;
                 }
                 if plains.is_empty() {
@@ -430,9 +468,12 @@ impl Client {
                 }
                 let mut any = false;
                 for p in plains {
-                    if let Some((ptype, payload)) = conn::accept_safer(&mut self.info, &p, self.cfg.hb_mode) {
-                        any = true;
-                        self.on_safer_packet(ptype, &payload);
+                    match conn::accept_safer_offset(&mut self.info, &p, self.cfg.hb_mode) {
+                        Some((ptype, off)) => {
+                            any = true;
+                            self.on_safer_packet(ptype, p, off);
+                        }
+                        None => self.pool.recycle(p),
                     }
                 }
                 if any {
@@ -442,7 +483,8 @@ impl Client {
         }
     }
 
-    fn on_safer_packet(&mut self, ptype: u8, payload: &[u8]) {
+    /// `plain[off..]` is the packet payload; the buffer is recycled or queued for sending.
+    fn on_safer_packet(&mut self, ptype: u8, plain: Vec<u8>, off: usize) {
         if self.state == State::Handshake2 {
             log::info!("changed state from to client_handshake2 to client_ready");
             self.state = State::Ready;
@@ -454,11 +496,13 @@ impl Client {
         if ptype == TYPE_HEARTBEAT {
             log::debug!("[hb]heart beat received,oppsite_roller={}", self.info.oppsite_roller);
             self.info.last_hb_recv_time = now_ms();
+            self.pool.recycle(plain);
             return;
         }
         if ptype == TYPE_DATA {
-            let Some((conv, data)) = wire::parse_data_payload(payload) else {
+            let Some((conv, data)) = wire::parse_data_payload(&plain[off..]) else {
                 log::warn!("unknown packet,this shouldnt happen.");
+                self.pool.recycle(plain);
                 return;
             };
             log::trace!("received a data from fake tcp,len:{}", data.len());
@@ -467,14 +511,18 @@ impl Client {
             }
             if !self.convs.is_conv_used(conv) {
                 log::info!("unknow conv {conv},ignore");
+                self.pool.recycle(plain);
                 return;
             }
             self.convs.update_active_time(conv, now_ms());
             let peer = *self.convs.find_data_by_conv(conv).unwrap();
-            if let Err(e) = self.udp.send_to(data, peer) {
-                log::warn!("sento returned error {e} to {peer}");
+            self.udp_tx.push(TxPacket { buf: plain, off: off + 4, dst: TxDst::Sock(peer) });
+            if self.udp_tx.len() >= 64 {
+                self.flush_udp_tx();
             }
+            return;
         }
+        self.pool.recycle(plain);
     }
 
     // ---------------------------------------------------------------- timer / state machine
@@ -659,9 +707,11 @@ impl Client {
                     return;
                 }
                 log::debug!("heartbeat sent <{:x},{:x}>", self.info.oppsite_id, self.info.my_id);
+                let mut plain = self.pool.take();
                 let hb: &[u8] = if self.cfg.hb_mode == 0 { &[] } else { &self.hb_buf };
-                let plain = conn::prepare_safer(&mut self.info, TYPE_HEARTBEAT, hb);
-                self.pipeline.submit(Job::Encrypt { key: self.key(), plain });
+                conn::prepare_safer_into(&mut self.info, TYPE_HEARTBEAT, hb, &mut plain);
+                let key = self.key();
+                self.pipeline.submit(Job::Encrypt { key, plain });
                 self.info.last_hb_sent_time = now;
             }
         }

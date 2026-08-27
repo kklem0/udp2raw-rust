@@ -167,12 +167,17 @@ impl Crypto {
 
     /// `my_encrypt`: returns the on-the-wire bytes for `data`, or `None` if `data` is too long.
     pub fn encrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
-        if data.len() > MAX_DATA_LEN {
+        let mut buf = Vec::with_capacity(data.len() + 64);
+        buf.extend_from_slice(data);
+        self.encrypt_vec(buf)
+    }
+
+    /// In-place variant of [`encrypt`](Self::encrypt): the plaintext buffer becomes the wire bytes.
+    pub fn encrypt_vec(&self, mut buf: Vec<u8>) -> Option<Vec<u8>> {
+        if buf.len() > MAX_DATA_LEN {
             log::warn!("len>max_data_len");
             return None;
         }
-        let mut buf = Vec::with_capacity(data.len() + 64);
-        buf.extend_from_slice(data);
         if self.is_hmac_used() {
             self.cipher_encrypt(&mut buf)?;
             self.tx_auth.append_tag(&mut buf);
@@ -185,17 +190,21 @@ impl Crypto {
 
     /// `my_decrypt`: returns the plaintext, or `None` on any integrity/format failure.
     pub fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
-        if data.len() > MAX_DATA_LEN {
+        self.decrypt_vec(data.to_vec())
+    }
+
+    /// In-place variant of [`decrypt`](Self::decrypt): the wire buffer becomes the plaintext.
+    pub fn decrypt_vec(&self, mut buf: Vec<u8>) -> Option<Vec<u8>> {
+        if buf.len() > MAX_DATA_LEN {
             log::warn!("len>max_data_len");
             return None;
         }
         if self.is_hmac_used() {
-            let body_len = self.rx_auth.verify(data)?;
-            let mut buf = data[..body_len].to_vec();
+            let body_len = self.rx_auth.verify(&buf)?;
+            buf.truncate(body_len);
             self.cipher_decrypt(&mut buf)?;
             Some(buf)
         } else {
-            let mut buf = data.to_vec();
             self.cipher_decrypt(&mut buf)?;
             let body_len = self.rx_auth.verify(&buf)?;
             buf.truncate(body_len);

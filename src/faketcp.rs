@@ -5,6 +5,7 @@
 use crate::config::Config;
 use crate::consts::{MAX_DATA_LEN, RECEIVE_WINDOW_LOWER_BOUND, RECEIVE_WINDOW_RANDOM_RANGE, WSCALE};
 use crate::net::raw::RawSockets;
+use crate::net::{send_batch, SendScratch, TxDst, TxPacket};
 use crate::packet::ip::{self, IPPROTO_ICMP, IPPROTO_ICMPV6, IPPROTO_TCP, IPPROTO_UDP};
 use crate::packet::{icmp, tcp, udp};
 use crate::types::RawMode;
@@ -126,8 +127,15 @@ pub struct RawCtx {
     pub max_rst_allowed: i32,
     ip_id_counter: u16,
     seg_buf: Vec<u8>,
-    pkt_buf: Vec<u8>,
+    /// Packets built by `send_raw`, sent with one `sendmmsg` per [`flush_tx`](Self::flush_tx).
+    tx_queue: Vec<TxPacket>,
+    tx_pool: Vec<Vec<u8>>,
+    scratch: SendScratch,
+    pub tx_dropped: u64,
 }
+
+/// Flush automatically once this many packets are queued.
+const TX_QUEUE_FLUSH: usize = 64;
 
 impl RawCtx {
     pub fn new(cfg: &Config, sockets: RawSockets) -> RawCtx {
@@ -149,8 +157,33 @@ impl RawCtx {
             max_rst_allowed: cfg.max_rst_allowed,
             ip_id_counter: (secure_random_u32() % 65535) as u16,
             seg_buf: Vec::with_capacity(2048),
-            pkt_buf: Vec::with_capacity(2048),
+            tx_queue: Vec::with_capacity(TX_QUEUE_FLUSH),
+            tx_pool: Vec::new(),
+            scratch: SendScratch::default(),
+            tx_dropped: 0,
         }
+    }
+
+    /// Hand every queued packet to the kernel (one `sendmmsg`). Call once per event-loop round.
+    pub fn flush_tx(&mut self) {
+        if self.tx_queue.is_empty() {
+            return;
+        }
+        let accepted = send_batch(self.sockets.send_fd, &self.tx_queue, &mut self.scratch);
+        let n = self.tx_queue.len();
+        if accepted < n {
+            self.tx_dropped += (n - accepted) as u64;
+            log::trace!("raw send: {} of {} packets dropped by the kernel", n - accepted, n);
+        }
+        for p in self.tx_queue.drain(..) {
+            if self.tx_pool.len() < 256 {
+                self.tx_pool.push(p.buf);
+            }
+        }
+    }
+
+    pub fn pending_tx(&self) -> usize {
+        self.tx_queue.len()
     }
 
     /// `init_filter`: remember the port (tcp/udp) and attach the kernel filter.
@@ -161,8 +194,8 @@ impl RawCtx {
         self.sockets.attach_filter(self.raw_mode, port, self.disable_bpf)
     }
 
-    /// `send_raw0`: build transport + IP headers around `payload` and send it.
-    /// Sets `send_info.data_len` for FakeTCP (used by `after_send`).
+    /// `send_raw0`: build transport + IP headers around `payload` and queue it for
+    /// [`flush_tx`](Self::flush_tx). Sets `send_info.data_len` for FakeTCP (used by `after_send`).
     pub fn send_raw(&mut self, raw: &mut RawInfo, payload: &[u8]) -> io::Result<()> {
         if self.random_drop != 0 && fast_random_u32() % 10000 < self.random_drop {
             return Ok(());
@@ -204,16 +237,21 @@ impl RawCtx {
                 if self.is_v6 { IPPROTO_ICMPV6 } else { IPPROTO_ICMP }
             }
         };
-        self.pkt_buf.clear();
+        let mut pkt = self.tx_pool.pop().unwrap_or_else(|| Vec::with_capacity(2048));
+        pkt.clear();
         let id = self.ip_id_counter;
         self.ip_id_counter = self.ip_id_counter.wrapping_add(1);
-        ip::build_ip_header(&mut self.pkt_buf, s.src_ip, s.dst_ip, protocol, self.ttl, id, self.seg_buf.len());
-        self.pkt_buf.extend_from_slice(&self.seg_buf);
-        let r = if self.lower_level { self.sockets.send_l2(&self.pkt_buf, &s.addr_ll) } else { self.sockets.send_ip(&self.pkt_buf, s.dst_ip) };
+        ip::build_ip_header(&mut pkt, s.src_ip, s.dst_ip, protocol, self.ttl, id, self.seg_buf.len());
+        pkt.extend_from_slice(&self.seg_buf);
+        let dst = if self.lower_level { TxDst::L2(s.addr_ll) } else { TxDst::Ip(s.dst_ip) };
+        self.tx_queue.push(TxPacket { buf: pkt, off: 0, dst });
         if self.raw_mode == RawMode::FakeTcp {
             raw.send_info.data_len = payload.len();
         }
-        r
+        if self.tx_queue.len() >= TX_QUEUE_FLUSH {
+            self.flush_tx();
+        }
+        Ok(())
     }
 
     /// `after_send_raw0`: advance the FakeTCP sequence number per `--seq-mode`.
