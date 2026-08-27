@@ -84,6 +84,23 @@ Both ends share the Pi's four cores here, which limits what the workers can add;
 figure varied between 4.7k and 10.2k across runs (it drops packets under bursts before it is
 CPU-bound), the Rust figures were stable.
 
+**Cipher modes on the Pi 4** (same setup, one session on 2026-08-27, current build; the
+loopback ceiling was ~15k pps in that session, so compare these rows only with each other).
+The last column is each daemon's user / sys CPU at a fixed 10k pps, server then client:
+
+| | loss-free pps | server / client CPU | user / sys at 10k pps |
+|---|---:|---|---|
+| C++, aes128cbc + md5 | 9,984 | 95 % / 83 % | — |
+| Rust `--threads 0`, aes128cbc + md5 | 11,968 | 88 % / 89 % | 26 / 46 %, 22 / 52 % |
+| Rust `--threads 0`, chacha20poly1305 | 13,984 | 86 % / 92 % | 17 / 47 %, 14 / 51 % |
+| Rust `--threads 2`, aes128cbc + md5 | 14,818 | 117 % / 121 % | 30 / 54 %, 23 / 59 % |
+| Rust `--threads 2`, chacha20poly1305 | 14,976 | 108 % / 108 % | 19 / 56 %, 14 / 59 % |
+
+`chacha20poly1305` cuts the daemons' own (user) CPU by about a third on this CPU and adds
+17 % to the single-threaded loss-free rate; most of the per-packet cost on the Pi 4 is
+kernel time (sys), which no cipher removes. Use it Rust↔Rust; it is not wire-compatible
+with the C++.
+
 **Docker, arm64, daemons pinned to 4 cores each** (fast cores, so only the ratios matter;
 `--aes-backend table` forces the Pi 4's software-AES code path):
 
@@ -98,8 +115,10 @@ CPU-bound), the Rust figures were stable.
 Where the difference comes from: table-driven AES instead of a bitsliced fallback on CPUs
 without AES instructions, batched socket drains (the C++ handles one packet per event-loop
 iteration and loses packets under bursts), and crypto on worker threads with batched
-handoff. With two workers the I/O thread's syscalls become the limit
-(`recvmmsg`/`sendmmsg` is the next step).
+handoff. With two workers the I/O thread's syscalls become the limit; the current build
+batches them with `recvmmsg`/`sendmmsg` (not yet re-measured in Docker; on the Pi 4 that
+batching costs more kernel time than the per-packet syscalls it replaced — see
+[PLAN.md](PLAN.md)).
 
 ## Tests
 

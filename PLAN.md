@@ -21,7 +21,7 @@ how to test on the Pis. Keep the **Status** section current.
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`) |
-| Pi 4 measurements (loopback, C++ vs Rust) | **done 2026-08-27** — see "Raspberry Pi 4 benchmark" below; Pi 5 and a two-box measurement still to do |
+| Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`) | **done 2026-08-27** — see the "Raspberry Pi 4" sections below; Pi 5 and a two-box measurement still to do |
 
 Docker e2e results are appended at the bottom of this file after each run.
 
@@ -105,9 +105,16 @@ crypto (`1a7fd3b`), `--cipher-mode chacha20poly1305` (AEAD, Rust↔Rust), a real
 `--unit-test`, e2e coverage for `easy-faketcp` and for `--lower-level auto` over a veth
 pair in a network namespace (also C++ interop across it).
 
-* **Measure again** (not yet done on purpose): the batched-syscall build on the Pi 4, the
-  deployment shape (Pi client ↔ VPS server over eth0), and the Pi 5. `bench.sh quick` in
-  Docker is the ~1 min regression check; `tools/bench/run_fixed_pi.sh` the user/sys CPU split.
+* **The batched-I/O build spends more system time on the Pi 4 than `60a36d6`** (measured
+  2026-08-27, see "chacha20poly1305 vs the deployed mode" below): at a fixed 10k pps the
+  `--threads 0` daemons are at 46/52 % sys vs 36/40 % before, user time slightly lower;
+  no-drop rate 12.0k vs 14.0k pps. Not yet understood. Profile in Docker with
+  `--aes-backend table` (`perf`, `strace -c` on both builds at a fixed rate with
+  `bench_fixed.sh`). Things to check: `mmsghdr`/iovec copies per message, the 32 × 64 KB
+  receive buffers cycling through the cache instead of one hot buffer, zero-timeout polls.
+* **Measure again**: the deployment shape (Pi client ↔ VPS server over eth0) and the Pi 5.
+  `bench.sh quick` in Docker is the ~1 min regression check; `tools/bench/run_quick_pi.sh`
+  the ~30 s-per-case Pi check (`FIXED=<pps>` gives the user/sys split per daemon).
 * TPACKET_V3 ring for RX; write headers into headroom of the job buffer to drop the last
   copy on the TX path.
 * CBC decrypt already batches blocks (`decrypt_blocks`); CBC encrypt is inherently serial.
@@ -261,6 +268,61 @@ steps. Both ends share the 4 cores here (3 threads each with `--threads 2`, plus
 generator), which is why the threaded gain (1.27× over single-threaded) is smaller than the
 2.0× seen with one daemon per 4-core box in Docker — the deployment case still needs a
 two-box measurement.
+
+## Raspberry Pi 4: chacha20poly1305 vs the deployed mode (2026-08-27, 4 batches of ≤ 96 s)
+
+Same loopback setup, driven by `tools/bench/run_quick_pi.sh` (sets `rmem_max`/`wmem_max`
+and the governor for the run, restores them, prints a health check); raw log
+`docs/bench/pi4-chacha-2026-08-27.txt`. Generator `udpbench2` (sendmmsg, 64-packet
+bursts), 5 search steps of 2 s. Rust = this repo at `3c380ad` (`udp2raw-head`: table AES,
+batched I/O); "old" = the running production binary `60a36d6` (per-packet syscalls) as a
+same-session control; C++ = production `fb13730`. Deployed mode = faketcp + aes128cbc +
+md5 + `--fix-gro`; chacha = the same with `--cipher-mode chacha20poly1305`.
+
+| case | no-drop pps | Mbit/s | server / client CPU | vs C++ |
+|---|---:|---:|---|---:|
+| C++ ↔ C++, deployed mode | 9,984 | 104 | 95 % / 83 % | 1.00× |
+| Rust `--threads 0`, deployed mode | 11,968 | 124 | 88 % / 89 % | 1.20× |
+| Rust `--threads 2`, deployed mode | 14,818 | 154 | 117 % / 121 % | 1.48× |
+| Rust `--threads 0`, chacha20poly1305 | 13,984 | 145 | 86 % / 92 % | 1.40× |
+| Rust `--threads 2`, chacha20poly1305 | 14,976 | 156 | 108 % / 108 % | 1.50× |
+| old `60a36d6` `--threads 0`, deployed mode (control) | 13,984 | 145 | 86 % / 91 % | 1.40× |
+| old `60a36d6` `--threads 2`, deployed mode (control) | 14,976 | 156 | 110 % / 112 % | 1.50× |
+
+Fixed 10,000 pps for 5 s (zero loss in every case); each daemon's CPU split into user (its
+own work: crypto, framing) and sys (kernel work inside its syscalls, including loopback
+delivery of what it sends):
+
+| case | server user / sys | client user / sys | whole box busy |
+|---|---|---|---|
+| Rust t0, aes128cbc + md5 | 26 % / 46 % | 22 % / 52 % | 201 % |
+| Rust t0, chacha20poly1305 | 17 % / 47 % | 14 % / 51 % | 171 % |
+| old `60a36d6` t0, aes128cbc + md5 | 29 % / 36 % | 24 % / 40 % | 183 % |
+| Rust t2, aes128cbc + md5 | 30 % / 54 % | 23 % / 59 % | 215 % |
+| Rust t2, chacha20poly1305 | 19 % / 56 % | 14 % / 59 % | 198 % |
+| old `60a36d6` t2, aes128cbc + md5 | 30 % / 49 % | 27 % / 51 % | 207 % |
+
+What the numbers mean:
+
+* **ChaCha20-Poly1305 cuts the daemons' own CPU by about a third on the A72** (user time
+  17 % vs 26 % on the server, 14 % vs 22 % on the client at 10k pps) and lifts the
+  single-threaded no-drop rate from 12.0k to 14.0k pps (+17 %). With `--threads 2` both
+  modes reach this session's loopback ceiling (~15k pps, `sys_busy` 250–290 %), chacha at
+  ~10 points less CPU per daemon. It is the mode to use Rust↔Rust on a Pi 4; the gain is
+  bounded because on this box the kernel, not the crypto, is most of the per-packet cost
+  (sys 46–59 % vs user 14–30 % per daemon).
+* **The batched-I/O build (`1a7fd3b`) spends more system time here than `60a36d6`**:
+  same session, same generator — old t0 13,984 pps vs HEAD 11,968; at 10k pps sys 46/52 %
+  vs 36/40 % per daemon while user time is slightly *lower* (in-place crypto). Batching was
+  added for the Docker box, where the I/O thread was at 100 % at 265k pps; the Pi 4 at
+  10–15k pps does not gain from it and the AES-CBC `--threads 0` case pays. Open item under
+  "Known gaps".
+* The C++ reproduced its earlier figure (9,984 vs 10,220). The `--threads 2` ceiling was
+  15k pps in this session vs 18.7k in the earlier quick run (generator burst shape and
+  router load differ between sessions) — compare rows only within one session.
+* All cases: probe 500/500, no `dropped`/`overloaded`/`rst` warnings; after every batch
+  `rmem_max`/`wmem_max` back at 212992 and the governor at `ondemand`, no leftover
+  processes, production daemon active, WireGuard handshakes continuing, temperature ≤ 63 °C.
 
 ## e2e run log
 

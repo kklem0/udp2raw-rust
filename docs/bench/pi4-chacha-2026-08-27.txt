@@ -1,0 +1,90 @@
+# 2026-08-27 23:51-23:59 +08:00 wutong (Raspberry Pi 4, Cortex-A72 x4 @1.8GHz, no AES instructions, Ubuntu 24.04, kernel 6.8.0-1047-raspi)
+# Deployed cipher mode (faketcp + aes128cbc + md5 + --fix-gro) vs --cipher-mode chacha20poly1305; C++ vs Rust; old build as control.
+# Both daemons on the box over loopback, -a, 1300-byte datagrams, generator udpbench2 (sendmmsg/recvmmsg, 64-packet bursts).
+# Binaries: cpp  = udp2raw fb13730, the production C++ build (portable-C AES on this CPU), md5 70454d13
+#           rust = udp2raw-head, this repo at 3c380ad (table AES, batched recvmmsg/sendmmsg I/O, chacha20poly1305), md5 1f8e7f40
+#           old  = /opt/udp2raw-rust-60a36d6-arm64, the previous build (per-packet syscalls) = the running production daemon, md5 47180f1a
+# Driver: tools/bench/run_quick_pi.sh (rmem_max/wmem_max 16 MB and governor=performance for the run, restored after; health check at the end).
+# Batches 1-3: no-drop-rate search (bench_ndr.sh, ITER=5 SECS=2 HI=32000, <=2% loss). Batch 4: fixed 10k pps for 5 s (bench_fixed.sh), user/sys split.
+# The router kept serving throughout (production udp2raw-wutong.service + WireGuard, ~2 Mbit/s background traffic, ~10% of one core).
+
+## batch 1
+# 2026-08-27T23:51:19+08:00 host=wutong kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=56C load=0.51 0.51 0.54
+# no-drop-rate search hi=32000 secs=2 iter=5 max_loss=0.02 size=1300 bench=./udpbench2 cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-head (1f8e7f40)
+  ndr-iter cpp_current rate=16000 offered=15967 sent=31936 recv=20939 loss=0.3443 server_cpu=96% client_cpu=97% sys_busy=273% irq=55%
+  ndr-iter cpp_current rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=79% client_cpu=68% sys_busy=211% irq=31%
+  ndr-iter cpp_current rate=12000 offered=11968 sent=23936 recv=21164 loss=0.1158 server_cpu=98% client_cpu=99% sys_busy=237% irq=46%
+  ndr-iter cpp_current rate=10000 offered=9984 sent=19968 recv=19968 loss=0.0000 server_cpu=95% client_cpu=83% sys_busy=209% irq=44%
+  ndr-iter cpp_current rate=11000 offered=10976 sent=21952 recv=21346 loss=0.0276 server_cpu=97% client_cpu=91% sys_busy=227% irq=48%
+NDR cpp_current | ndr_pps=9984 mbps=104 size=1300 | server_cpu=95% client_cpu=83% sys_busy=209% sys_irq=44% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.10s | warnlines=0 temp=58.4C
+  ndr-iter rust_current_t0 rate=16000 offered=15967 sent=31936 recv=27627 loss=0.1349 server_cpu=95% client_cpu=100% sys_busy=234% irq=56%
+  ndr-iter rust_current_t0 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=55% client_cpu=57% sys_busy=144% irq=28%
+  ndr-iter rust_current_t0 rate=12000 offered=11967 sent=23936 recv=23936 loss=0.0000 server_cpu=88% client_cpu=89% sys_busy=229% irq=54%
+  ndr-iter rust_current_t0 rate=14000 offered=13982 sent=27968 recv=26610 loss=0.0486 server_cpu=94% client_cpu=98% sys_busy=258% irq=56%
+  ndr-iter rust_current_t0 rate=13000 offered=12988 sent=25984 recv=24530 loss=0.0560 server_cpu=89% client_cpu=97% sys_busy=270% irq=55%
+NDR rust_current_t0 | ndr_pps=11968 mbps=124 size=1300 | server_cpu=88% client_cpu=89% sys_busy=229% sys_irq=54% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.09s | warnlines=0 temp=60.9C
+  ndr-iter rust_current_t2 rate=16000 offered=15888 sent=31808 recv=29405 loss=0.0755 server_cpu=114% client_cpu=119% sys_busy=312% irq=63%
+  ndr-iter rust_current_t2 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=66% client_cpu=64% sys_busy=168% irq=35%
+  ndr-iter rust_current_t2 rate=12000 offered=11968 sent=23936 recv=23936 loss=0.0000 server_cpu=98% client_cpu=97% sys_busy=224% irq=49%
+  ndr-iter rust_current_t2 rate=14000 offered=13983 sent=27968 recv=27815 loss=0.0055 server_cpu=112% client_cpu=113% sys_busy=276% irq=57%
+  ndr-iter rust_current_t2 rate=15000 offered=14975 sent=29952 recv=29636 loss=0.0106 server_cpu=117% client_cpu=121% sys_busy=292% irq=65%
+NDR rust_current_t2 | ndr_pps=14818 mbps=154 size=1300 | server_cpu=117% client_cpu=121% sys_busy=292% sys_irq=65% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.11s | warnlines=0 temp=62.3C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/wutong.conf --threads 2
+# udp2raw-wutong.service: active; wg1 latest handshake: 54s ago
+# done 2026-08-27T23:52:55+08:00 temp=59C
+
+## batch 2
+# 2026-08-27T23:54:23+08:00 host=wutong kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=56C load=0.45 0.58 0.57
+# no-drop-rate search hi=32000 secs=2 iter=5 max_loss=0.02 size=1300 bench=./udpbench2 cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-head (1f8e7f40)
+  ndr-iter rust_chacha_t0 rate=16000 offered=15968 sent=31936 recv=30586 loss=0.0423 server_cpu=94% client_cpu=99% sys_busy=238% irq=64%
+  ndr-iter rust_chacha_t0 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=50% client_cpu=52% sys_busy=139% irq=33%
+  ndr-iter rust_chacha_t0 rate=12000 offered=11968 sent=23936 recv=23936 loss=0.0000 server_cpu=75% client_cpu=77% sys_busy=184% irq=49%
+  ndr-iter rust_chacha_t0 rate=14000 offered=13984 sent=27968 recv=27968 loss=0.0000 server_cpu=86% client_cpu=92% sys_busy=225% irq=57%
+  ndr-iter rust_chacha_t0 rate=15000 offered=14976 sent=29952 recv=28676 loss=0.0426 server_cpu=90% client_cpu=97% sys_busy=278% irq=63%
+NDR rust_chacha_t0 | ndr_pps=13984 mbps=145 size=1300 | server_cpu=86% client_cpu=92% sys_busy=225% sys_irq=57% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=59.9C
+  ndr-iter rust_chacha_t2 rate=16000 offered=15968 sent=31936 recv=27493 loss=0.1391 server_cpu=99% client_cpu=103% sys_busy=309% irq=66%
+  ndr-iter rust_chacha_t2 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=60% client_cpu=59% sys_busy=172% irq=30%
+  ndr-iter rust_chacha_t2 rate=12000 offered=11967 sent=23936 recv=23936 loss=0.0000 server_cpu=89% client_cpu=86% sys_busy=205% irq=49%
+  ndr-iter rust_chacha_t2 rate=14000 offered=13981 sent=27968 recv=27968 loss=0.0000 server_cpu=102% client_cpu=101% sys_busy=231% irq=53%
+  ndr-iter rust_chacha_t2 rate=15000 offered=14973 sent=29952 recv=29952 loss=0.0000 server_cpu=108% client_cpu=108% sys_busy=256% irq=64%
+NDR rust_chacha_t2 | ndr_pps=14976 mbps=156 size=1300 | server_cpu=108% client_cpu=108% sys_busy=256% sys_irq=64% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.09s | warnlines=0 temp=62.8C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/wutong.conf --threads 2
+# udp2raw-wutong.service: active; wg1 latest handshake: 87s ago
+# done 2026-08-27T23:55:28+08:00 temp=60C
+
+## batch 3-ctrl60a36d6
+# 2026-08-27T23:55:57+08:00 host=wutong kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=57C load=1.52 0.88 0.67
+# no-drop-rate search hi=32000 secs=2 iter=5 max_loss=0.02 size=1300 bench=./udpbench2 cpp=./udp2raw-cpp (70454d13) rust=/opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+  ndr-iter rust_current_t0 rate=16000 offered=15955 sent=31936 recv=28912 loss=0.0947 server_cpu=91% client_cpu=99% sys_busy=248% irq=71%
+  ndr-iter rust_current_t0 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=50% client_cpu=53% sys_busy=157% irq=43%
+  ndr-iter rust_current_t0 rate=12000 offered=11967 sent=23936 recv=23936 loss=0.0000 server_cpu=73% client_cpu=78% sys_busy=185% irq=45%
+  ndr-iter rust_current_t0 rate=14000 offered=13983 sent=27968 recv=27968 loss=0.0000 server_cpu=86% client_cpu=91% sys_busy=212% irq=56%
+  ndr-iter rust_current_t0 rate=15000 offered=14976 sent=29952 recv=29151 loss=0.0267 server_cpu=91% client_cpu=97% sys_busy=256% irq=60%
+NDR rust_current_t0 | ndr_pps=13984 mbps=145 size=1300 | server_cpu=86% client_cpu=91% sys_busy=212% sys_irq=56% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=61.3C
+  ndr-iter rust_current_t2 rate=16000 offered=15968 sent=31936 recv=29045 loss=0.0905 server_cpu=106% client_cpu=107% sys_busy=294% irq=63%
+  ndr-iter rust_current_t2 rate=8000 offered=7968 sent=15936 recv=15936 loss=0.0000 server_cpu=63% client_cpu=62% sys_busy=184% irq=31%
+  ndr-iter rust_current_t2 rate=12000 offered=11967 sent=23936 recv=23936 loss=0.0000 server_cpu=92% client_cpu=90% sys_busy=208% irq=53%
+  ndr-iter rust_current_t2 rate=14000 offered=13983 sent=27968 recv=27968 loss=0.0000 server_cpu=106% client_cpu=107% sys_busy=242% irq=61%
+  ndr-iter rust_current_t2 rate=15000 offered=14975 sent=29952 recv=29952 loss=0.0000 server_cpu=110% client_cpu=112% sys_busy=252% irq=63%
+NDR rust_current_t2 | ndr_pps=14976 mbps=156 size=1300 | server_cpu=110% client_cpu=112% sys_busy=252% sys_irq=63% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.08s | warnlines=0 temp=62.8C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/wutong.conf --threads 2
+# udp2raw-wutong.service: active; wg1 latest handshake: 60s ago
+# done 2026-08-27T23:57:01+08:00 temp=60C
+
+## batch 4-fixed10k
+# 2026-08-27T23:58:32+08:00 host=wutong kernel=6.8.0-1047-raspi ncpu=4 max_khz=1800000 temp=58C load=0.80 0.77 0.65
+# fixed-rate rate=10000 burst=64 secs=5 size=1300 bench=./udpbench2
+# cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-head (1f8e7f40) old=/opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+FIXED rust_current_t0 | rate=10000 offered=9996 burst=64 size=1300 sent=49984 recv=49984 loss=0.0000 | server user=26% sys=46% | client user=22% sys=52% | sys_busy=201% sys_irq=41% | warnlines=0
+FIXED rust_chacha_t0 | rate=10000 offered=9996 burst=64 size=1300 sent=49984 recv=49984 loss=0.0000 | server user=17% sys=47% | client user=14% sys=51% | sys_busy=171% sys_irq=41% | warnlines=0
+FIXED old_current_t0 | rate=10000 offered=9993 burst=64 size=1300 sent=49984 recv=49984 loss=0.0000 | server user=29% sys=36% | client user=24% sys=40% | sys_busy=183% sys_irq=42% | warnlines=0
+FIXED rust_current_t2 | rate=10000 offered=9996 burst=64 size=1300 sent=49984 recv=49984 loss=0.0000 | server user=30% sys=54% | client user=23% sys=59% | sys_busy=215% sys_irq=41% | warnlines=0
+FIXED rust_chacha_t2 | rate=10000 offered=9996 burst=64 size=1300 sent=49984 recv=49984 loss=0.0000 | server user=19% sys=56% | client user=14% sys=59% | sys_busy=198% sys_irq=44% | warnlines=0
+FIXED old_current_t2 | rate=10000 offered=9996 burst=64 size=1300 sent=49984 recv=49984 loss=0.0000 | server user=30% sys=49% | client user=27% sys=51% | sys_busy=207% sys_irq=46% | warnlines=0
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 584891 /opt/udp2raw-rust-60a36d6-arm64 --conf-file /etc/udp2raw/wutong.conf --threads 2
+# udp2raw-wutong.service: active; wg1 latest handshake: 108s ago
+# done 2026-08-27T23:59:49+08:00 temp=61C
