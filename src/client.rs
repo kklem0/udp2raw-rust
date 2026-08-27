@@ -628,6 +628,10 @@ impl Client {
             if let Some(sw) = self.endpoint.on_cycle(now, reason) {
                 self.apply_switch(&sw);
             }
+            // make sure the address we are about to use has its DROP rule (retries a rule
+            // whose install failed on an earlier cycle; a no-op once it is in place)
+            let cur = self.remote;
+            self.ensure_installed(cur);
 
             let src_ip = match self.cfg.source_ip {
                 Some(ip) => ip,
@@ -831,15 +835,22 @@ impl Client {
     }
 
     /// Rule and route for `addr`, installed before the first packet goes there.
+    /// Rule and route for `addr`, installed before the first packet goes there. Idempotent
+    /// and self-healing: if a previous `add_pattern` failed (iptables was busy) the entry is
+    /// kept with `rule = None` and the rule is retried on the next call, so the DROP rule for
+    /// the address in use is (re)established every reconnect cycle even without a switch.
     fn ensure_installed(&mut self, addr: SocketAddr) {
-        if self.installed.iter().any(|i| i.addr == addr) {
-            return;
+        let pos = self.installed.iter().position(|i| i.addr == addr);
+        if let Some(p) = pos {
+            if self.installed[p].rule.is_some() || self.ipt.is_none() {
+                return; // already fully installed (or no -a: nothing to add)
+            }
         }
-        let rule = match &self.ipt {
+        let rule = match self.ipt.clone() {
             Some(ipt) => {
-                let p = self.pattern_for(addr);
-                match ipt.add_pattern(&p) {
-                    Ok(()) => Some(p),
+                let pat = self.pattern_for(addr);
+                match ipt.add_pattern(&pat) {
+                    Ok(()) => Some(pat),
                     Err(e) => {
                         log::warn!("{e}");
                         None
@@ -848,8 +859,13 @@ impl Client {
             }
             None => None,
         };
-        let route = self.install_route(addr);
-        self.installed.push(Installed { addr, route, rule });
+        match pos {
+            Some(p) => self.installed[p].rule = rule,
+            None => {
+                let route = self.install_route(addr);
+                self.installed.push(Installed { addr, route, rule });
+            }
+        }
     }
 
     fn release(&mut self, addr: SocketAddr) {
