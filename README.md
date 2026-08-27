@@ -28,17 +28,15 @@ Everything else — `--raw-mode faketcp|udp|icmp|easy-faketcp`, `--cipher-mode`,
 ## Build
 
 ```sh
-cargo build --release                         # native
-# Raspberry Pi from a Debian/Ubuntu x86_64 host:
+cargo build --release                         # native (on the Pi itself, with rustup)
+# cross-compile for the Pi from a Debian/Ubuntu x86_64 host:
 sudo apt-get install g++-aarch64-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
-# fully static (musl) binary:
-rustup target add aarch64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --release --target aarch64-unknown-linux-gnu
+# fully static binary without a local cross toolchain (needs Docker):
+cargo install cross && cross build --release --target aarch64-unknown-linux-musl
 ```
-
-Building on the Pi itself also works (`rustup` + `cargo build --release`).
 
 ## Usage
 
