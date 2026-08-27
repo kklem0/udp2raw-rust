@@ -29,8 +29,12 @@ What is different from the C++ version:
   kernel's software PAN makes every user-memory access inside a syscall expensive and the
   batched calls cost ~10 % more CPU per packet — auto-detected, see PLAN.md).
 * **`--cipher-mode chacha20poly1305`** (Rust↔Rust only): a real AEAD, and the fast choice
-  on CPUs without AES instructions (NEON ChaCha20). `--auth-mode` is ignored in this mode;
-  anti-replay stays on. Both ends must run this port.
+  on CPUs without AES instructions (NEON ChaCha20). XChaCha20-Poly1305 with a fresh random
+  24-byte nonce per packet (`[nonce 24][ciphertext][tag 16]`, +40 bytes), so the payload
+  carries no counter or constant — it is indistinguishable from random bytes, like the AES
+  modes. The cipher only changes the payload: `--raw-mode faketcp|udp|icmp` and `--fix-gro`
+  disguise it exactly as before. `--auth-mode` is ignored in this mode; anti-replay stays
+  on. Both ends must run this port.
 * **`--unit-test`** runs a built-in self-test: key derivation against the C++ reference,
   every cipher/auth mode on every AES backend the CPU offers, framing and checksums — handy
   right after copying a binary to a new box.
@@ -95,9 +99,9 @@ compare these rows only with each other — the C++ row is from the same session
 |---|---:|---:|---|
 | C++, aes128cbc + md5 | 9,984 | 104 | 95 % / 83 % |
 | Rust `--threads 0`, aes128cbc + md5 | 13,984 | 145 | 87 % / 86 % |
-| Rust `--threads 0`, chacha20poly1305 | 15,968 | 166 | 85 % / 86 % |
+| Rust `--threads 0`, chacha20poly1305 | 16,992 | 177 | 94 % / 94 % |
 | Rust `--threads 2`, aes128cbc + md5 | 14,976 | 156 | 112 % / 111 % |
-| Rust `--threads 2`, chacha20poly1305 | **18,863** | 196 | 117 % / 116 % |
+| Rust `--threads 2`, chacha20poly1305 | **19,968** | 208 | 121 % / 121 % |
 
 `chacha20poly1305` cuts the daemons' own (user) CPU by about a third on this CPU (at 10k pps:
 17 % vs 26 % on the server, 14 % vs 22 % on the client); most of the per-packet cost on the

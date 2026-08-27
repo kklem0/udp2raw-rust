@@ -133,7 +133,9 @@ packet: auth != hmac_sha1:  cipher(plain || tag, normal_key)
         aes128cfb: ECB(cipher_key_encrypt)(block0) then CFB-128 with zero IV
 bare:   [iv u64][pad u64]['b'][payload]            handshake payload = 3 × u32 BE ids
 safer:  [my_id u32][oppsite_id u32][seq u64]['h'|'d'][roller][payload]; 'd' payload = [conv u32][datagram]
-gro:    [len u16][encrypted] with the first 16 bytes ECB-encrypted (xor: first 2 bytes ^ gro_xor)
+gro:    [len u16][encrypted] with the first 16 bytes ECB-encrypted (xor/chacha: first 2 bytes ^ gro_xor)
+chacha20poly1305 (Rust only): [nonce 24, random][XChaCha20-Poly1305(plain)][tag 16], keys =
+        cipher_key_encrypt/decrypt[..32]; ids and anti-replay seq stay inside the plaintext
 ```
 
 ## Raspberry Pi 4 benchmark (2026-08-27)
@@ -380,6 +382,18 @@ Pi 4 no-drop rate, same setup as the previous section (`docs/bench/pi4-syscalls-
 The fixed build matches the old build's rate at slightly less CPU in the deployed mode, and
 with chacha it goes past what looked like a 15k pps kernel ceiling (18.9k with `--threads 2`).
 
+**chacha20poly1305 nonces (2026-08-28, same day):** the first version sent a 12-byte nonce
+of `[4-byte per-process constant][8-byte counter]` in the clear, and `--fix-gro` masks only
+the two length bytes in this mode — a visible pattern at the start of every payload that the
+AES modes do not have. The mode now uses XChaCha20-Poly1305 with a fresh random 24-byte
+nonce per packet from a per-thread ChaCha12 CSPRNG (seeded from the OS, reseeded every 2^24
+nonces; no lock, no syscall per packet): `[nonce 24][ciphertext][tag 16]`, +40 bytes, payload
+indistinguishable from random. Pi 4 quick run (`docs/bench/pi4-xchacha-2026-08-28.txt`):
+chacha `--threads 0` 16,992 pps (94 % / 94 %), `--threads 2` 19,968 pps (121 % / 121 %) —
+no measurable cost vs the 12-byte-nonce build (15,968 / 18,863). The raw-mode disguise is
+untouched by the cipher mode: nothing in `faketcp.rs`/`client.rs`/`server.rs` branches on
+it. Wire-format change of a mode only this port speaks; both ends update together.
+
 Docker (fast cores, hardware PAN, split cores; `docs/bench/docker-syscalls-2026-08-28.txt`):
 `mmsg` vs `single` is 137k vs 124–135k pps at `--threads 0` (table AES), 298k vs 298k at
 `--threads 2` (table) and 311–323k vs 282–308k at `--threads 2` (hardware AES) — a few
@@ -397,6 +411,11 @@ lose to the plain calls — measure on the target CPU, not on a stand-in.
 
 25/25 pass (`tools/docker/e2e.sh`, Docker Desktop arm64, `--cap-add NET_RAW,NET_ADMIN,SYS_ADMIN`,
 C++ reference built from `~/git/udp2raw`); every probe 2000/2000.
+
+### 2026-08-28 — `ONLY=chacha` after the switch to XChaCha20-Poly1305 random nonces
+
+rust_rust_chacha and rust_rust_chacha_gro (faketcp, `--fix-gro --threads 2`): 2/2 pass,
+probes 2000/2000, blast 405–415k pps through the tunnel (unpinned container).
 
 ### 2026-08-27 — Docker Desktop (Apple Silicon), `rust:1-bookworm` arm64, loopback
 
