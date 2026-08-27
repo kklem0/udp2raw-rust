@@ -164,7 +164,9 @@ impl Client {
             }
             let now = now_ms();
             let elapsed = now.saturating_sub(last_timer);
-            let timeout = if self.udp_pending || self.raw_pending || self.pipeline.in_flight() > 0 {
+            // Only a socket we stopped draining early needs an immediate re-poll; pipeline
+            // completions wake us through the eventfd, so never spin on them.
+            let timeout = if self.udp_pending || self.raw_pending {
                 Duration::ZERO
             } else {
                 Duration::from_millis(TIMER_INTERVAL_MS.saturating_sub(elapsed).max(1))

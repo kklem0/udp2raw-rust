@@ -171,7 +171,9 @@ impl Server {
             }
             let now = now_ms();
             let elapsed = now.saturating_sub(last_timer);
-            let timeout = if self.raw_pending || !self.socks_pending.is_empty() || self.pipeline.in_flight() > 0 {
+            // Only a socket we stopped draining early needs an immediate re-poll; pipeline
+            // completions wake us through the eventfd, so never spin on them.
+            let timeout = if self.raw_pending || !self.socks_pending.is_empty() {
                 Duration::ZERO
             } else {
                 Duration::from_millis(TIMER_INTERVAL_MS.saturating_sub(elapsed).max(1))

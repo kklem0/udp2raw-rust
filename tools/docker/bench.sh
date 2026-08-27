@@ -29,23 +29,34 @@ echo "# $(date -Is) docker nproc=$(nproc) cpuset=$CPUSET hi=$HI secs=$SECS"
 echo "# cpp=$(./udp2raw-cpp -h 2>&1 | sed -n 2p | tr -s ' ') rust=$(git -C /work rev-parse --short HEAD 2>/dev/null)"
 run() {
     local out
-    out=$(taskset -c "$CPUSET" bash ./bench_ndr.sh "$1" "$2" "$3" "$4" "$5" "$6" 1300 "$HI" "$SECS" 2>&1)
+    out=$(bash ./bench_ndr.sh "$1" "$2" "$3" "$4" "$5" "$6" 1300 "$HI" "$SECS" 2>&1)
     if ! printf '%s\n' "$out" | grep -E "^NDR"; then echo "case $1 produced no result:"; printf '%s\n' "$out" | tail -5; fi
     sleep 1
 }
 PROD="--log-level 4 --fix-gro"
 T="--aes-backend table"    # the code path of a CPU without AES instructions (Raspberry Pi 4)
-run cpp_cpp                 ./udp2raw-cpp  ./udp2raw-cpp  "$PROD" "" ""
-run rust_t0_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 0" "--threads 0"
-run rust_t1_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 1" "--threads 1"
-run rust_t2_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 2" "--threads 2"
-run rust_t3_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 3" "--threads 3"
-run rust_t0_hw              ./udp2raw-rust ./udp2raw-rust "$PROD" "--threads 0" "--threads 0"
-run rust_t2_hw              ./udp2raw-rust ./udp2raw-rust "$PROD" "--threads 2" "--threads 2"
-if [ -n "$RUST_EXTRA" ]; then
-    run extra_t0_table      ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD $T" "--threads 0" "--threads 0"
-    run extra_t2_table      ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD $T" "--threads 2" "--threads 2"
-    run extra_t3_table      ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD $T" "--threads 3" "--threads 3"
-    run extra_t2_hw         ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD" "--threads 2" "--threads 2"
+matrix() {
+    run cpp_cpp                 ./udp2raw-cpp  ./udp2raw-cpp  "$PROD" "" ""
+    run rust_t0_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 0" "--threads 0"
+    run rust_t1_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 1" "--threads 1"
+    run rust_t2_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 2" "--threads 2"
+    run rust_t3_table           ./udp2raw-rust ./udp2raw-rust "$PROD $T" "--threads 3" "--threads 3"
+    run rust_t0_hw              ./udp2raw-rust ./udp2raw-rust "$PROD" "--threads 0" "--threads 0"
+    run rust_t2_hw              ./udp2raw-rust ./udp2raw-rust "$PROD" "--threads 2" "--threads 2"
+    if [ -n "$RUST_EXTRA" ]; then
+        run extra_t0_table      ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD $T" "--threads 0" "--threads 0"
+        run extra_t2_table      ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD $T" "--threads 2" "--threads 2"
+        run extra_t2_hw         ./udp2raw-rust-extra ./udp2raw-rust-extra "$PROD" "--threads 2" "--threads 2"
+    fi
+}
+# pass 1: both daemons plus the generator share 4 cores (a single small box running both ends)
+echo "## shared: everything on cpus $CPUSET"
+export SERVER_CPUS=$CPUSET CLIENT_CPUS=$CPUSET GEN_CPUS=$CPUSET
+matrix
+# pass 2: each daemon gets its own 4 cores (one daemon per box), generator elsewhere
+if [ "$(nproc)" -ge 10 ]; then
+    echo "## split: server cpus 0-3, client cpus 4-7, generator cpus 8-9"
+    export SERVER_CPUS=0-3 CLIENT_CPUS=4-7 GEN_CPUS=8-9
+    matrix
 fi
 echo "# done $(date -Is)"

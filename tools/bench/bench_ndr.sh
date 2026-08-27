@@ -11,6 +11,8 @@ NAME=$1; SBIN=$2; CBIN=$3; COMMON=$4; SARGS=$5; CARGS=$6; SIZE=${7:-1300}; HI=${
 SPORT=${SPORT:-34096}; CPORT=${CPORT:-33333}; TPORT=${TPORT:-37777}
 BENCH=${BENCH:-./udpbench}; PROBE=${PROBE:-./udp_probe.py}; LOGDIR=${LOGDIR:-/tmp/udp2raw-bench}
 MAX_LOSS=${MAX_LOSS:-0.02}; ITER=${ITER:-7}
+# optional CPU pinning per process (e.g. SERVER_CPUS=0-3 CLIENT_CPUS=4-7 GEN_CPUS=8-9)
+S_PIN=${SERVER_CPUS:+taskset -c $SERVER_CPUS}; C_PIN=${CLIENT_CPUS:+taskset -c $CLIENT_CPUS}; G_PIN=${GEN_CPUS:+taskset -c $GEN_CPUS}
 mkdir -p "$LOGDIR"
 pids=()
 cleanup() { for p in "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; pids=(); sleep 0.6; }
@@ -19,9 +21,9 @@ cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
 sys_ticks() { awk 'NR==1{print $2+$3+$4, $7+$8}' /proc/stat; }
 temp() { awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null; }
 
-$SBIN -s -l 127.0.0.1:$SPORT -r 127.0.0.1:$TPORT -k benchpw -a $COMMON $SARGS > "$LOGDIR/$NAME.server.log" 2>&1 & SPID=$!; pids+=($SPID)
+$S_PIN $SBIN -s -l 127.0.0.1:$SPORT -r 127.0.0.1:$TPORT -k benchpw -a $COMMON $SARGS > "$LOGDIR/$NAME.server.log" 2>&1 & SPID=$!; pids+=($SPID)
 sleep 0.6
-$CBIN -c -l 127.0.0.1:$CPORT -r 127.0.0.1:$SPORT -k benchpw -a $COMMON $CARGS > "$LOGDIR/$NAME.client.log" 2>&1 & CPID=$!; pids+=($CPID)
+$C_PIN $CBIN -c -l 127.0.0.1:$CPORT -r 127.0.0.1:$SPORT -k benchpw -a $COMMON $CARGS > "$LOGDIR/$NAME.client.log" 2>&1 & CPID=$!; pids+=($CPID)
 for _ in $(seq 1 200); do grep -q client_ready "$LOGDIR/$NAME.client.log" 2>/dev/null && break; sleep 0.1; done
 if ! grep -q client_ready "$LOGDIR/$NAME.client.log"; then echo "NDR $NAME | client never became ready"; exit 1; fi
 sleep 0.5
@@ -34,10 +36,10 @@ sleep 0.3
 HZ=$(getconf CLK_TCK)
 try_rate() { # RATE -> sets STEADY SCPU CCPU SYSB SYSQ
     local rate=$1
-    $BENCH sink 127.0.0.1 $TPORT $((SECS + 2)) > "$LOGDIR/$NAME.sink.log" 2>&1 & local sink=$!; pids+=($sink)
+    $G_PIN $BENCH sink 127.0.0.1 $TPORT $((SECS + 2)) > "$LOGDIR/$NAME.sink.log" 2>&1 & local sink=$!; pids+=($sink)
     sleep 0.4
     read B0 Q0 < <(sys_ticks); local S0=$(cpu_ticks $SPID) C0=$(cpu_ticks $CPID) T0=$(date +%s.%N)
-    $BENCH blast 127.0.0.1 $CPORT $SECS $SIZE $rate > "$LOGDIR/$NAME.blast.log" 2>&1
+    $G_PIN $BENCH blast 127.0.0.1 $CPORT $SECS $SIZE $rate > "$LOGDIR/$NAME.blast.log" 2>&1
     local T1=$(date +%s.%N) S1=$(cpu_ticks $SPID) C1=$(cpu_ticks $CPID); read B1 Q1 < <(sys_ticks)
     wait $sink 2>/dev/null
     local DT=$(awk "BEGIN{print $T1-$T0}")
