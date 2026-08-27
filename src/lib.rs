@@ -10,6 +10,8 @@ pub mod config;
 pub mod consts;
 pub mod conv;
 pub mod crypto;
+pub mod dns;
+pub mod endpoint;
 pub mod logging;
 pub mod packet;
 pub mod selftest;
