@@ -38,7 +38,7 @@ fn main() {
         cfg.auth_mode.name(),
         cfg.key,
         cfg.local_addr,
-        cfg.remote_addr,
+        cfg.remote,
         cfg.socket_buf_size,
         cfg.threads,
         if cfg.easy_faketcp { " easy_faketcp=1" } else { "" }
@@ -62,10 +62,13 @@ fn main() {
 mod linux {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
     use udp2raw::config::Config;
     use udp2raw::crypto::{Crypto, Keys};
+    use udp2raw::dns::{DnsConfig, Resolver};
+    use udp2raw::endpoint::{EndpointController, EndpointOptions};
     use udp2raw::types::ProgramMode;
-    use udp2raw::util::{hex, secure_random_u32_nz};
+    use udp2raw::util::{hex, now_ms, secure_random_u32_nz};
     use udp2raw::{client, iptables, server};
 
     static EXIT_FLAG: AtomicBool = AtomicBool::new(false);
@@ -83,13 +86,51 @@ mod linux {
         }
     }
 
-    pub fn run(cfg: Config) -> i32 {
+    /// Client: decide the relay address to start with (DNS, then the cache, then
+    /// `--bootstrap-addr`) and keep the controller for later re-resolution.
+    fn bootstrap_endpoint(cfg: &mut Config) -> Result<EndpointController, i32> {
+        let opts = EndpointOptions { allow_private: cfg.allow_private_endpoint, cache_file: cfg.endpoint_cache.clone(), bootstrap: cfg.bootstrap_addr, ..EndpointOptions::default() };
+        let dns = DnsConfig { servers: cfg.dns_servers.clone(), device: cfg.underlay_dev.clone(), timeout: Duration::from_millis(cfg.dns_timeout_ms) };
+        if cfg.remote.is_dynamic() {
+            log::info!("endpoint: resolving {} through {:?}{} (timeout {} ms, cache {})", cfg.remote, cfg.dns_servers, cfg.underlay_dev.as_deref().map_or(String::new(), |d| format!(" via {d}")), cfg.dns_timeout_ms, cfg.endpoint_cache.as_deref().map_or("off".to_string(), |p| p.display().to_string()));
+        }
+        loop {
+            match EndpointController::bootstrap(cfg.remote.clone(), Box::new(Resolver { cfg: dns.clone() }), opts.clone(), now_ms()) {
+                Ok(ep) => {
+                    cfg.remote_addr = ep.current();
+                    return Ok(ep);
+                }
+                Err(e) if cfg.retry_on_error => {
+                    log::warn!("endpoint: {e}; retry in 10 seconds");
+                    for _ in 0..100 {
+                        if EXIT_FLAG.load(Ordering::Relaxed) {
+                            return Err(0);
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                Err(e) => {
+                    log::error!("endpoint: {e}");
+                    return Err(255);
+                }
+            }
+        }
+    }
+
+    pub fn run(mut cfg: Config) -> i32 {
         install_signals();
         if unsafe { libc::geteuid() } != 0 {
             log::warn!("root check failed, it seems like you are using a non-root account. we can try to continue, but it may fail. If you want to run udp2raw as non-root, you have to add iptables rule manually, and grant udp2raw CAP_NET_RAW capability, check README.md in repo for more info.");
         } else {
             log::warn!("you can run udp2raw with non-root account for better security. check README.md in repo for more info.");
         }
+        let endpoint = match cfg.mode {
+            ProgramMode::Client => match bootstrap_endpoint(&mut cfg) {
+                Ok(ep) => Some(ep),
+                Err(code) => return code,
+            },
+            ProgramMode::Server => None,
+        };
         log::info!("remote_ip=[{}], make sure this is a vaild IP address", cfg.remote_addr.ip());
 
         let const_id = secure_random_u32_nz();
@@ -142,7 +183,7 @@ mod linux {
         };
 
         let result = match cfg.mode {
-            ProgramMode::Client => client::run(cfg, crypto, const_id, &EXIT_FLAG),
+            ProgramMode::Client => client::run(cfg, crypto, const_id, &EXIT_FLAG, endpoint.expect("client endpoint"), ipt.clone()),
             ProgramMode::Server => server::run(cfg, crypto, const_id, &EXIT_FLAG),
         };
         if let Some(i) = &ipt {

@@ -4,7 +4,7 @@ use crate::types::RawMode;
 use crate::util::fast_random_u32;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 /// Convert a `SocketAddr` into a `sockaddr_storage` + length for libc calls.
 pub fn to_sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
@@ -87,10 +87,33 @@ pub fn set_buf_size(fd: RawFd, size: usize, force: bool) -> io::Result<()> {
 /// The source address the kernel would use to reach `remote` (connect a UDP socket, read
 /// back its local address) — `get_src_adress2`.
 pub fn get_src_addr(remote: SocketAddr) -> io::Result<IpAddr> {
+    get_src_addr_dev(remote, None)
+}
+
+/// The source address the kernel picks for `remote`, optionally as seen from `dev`
+/// (`SO_BINDTODEVICE` on the probe socket, like the raw sender with `--underlay-dev`).
+pub fn get_src_addr_dev(remote: SocketAddr, dev: Option<&str>) -> io::Result<IpAddr> {
     let bind: SocketAddr = if remote.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
     let s = std::net::UdpSocket::bind(bind)?;
+    if let Some(dev) = dev {
+        bind_to_device(s.as_raw_fd(), dev)?;
+    }
     s.connect(remote)?;
     Ok(s.local_addr()?.ip())
+}
+
+/// `SO_BINDTODEVICE`: route lookups and packets of this socket stay on `dev`.
+pub fn bind_to_device(fd: RawFd, dev: &str) -> io::Result<()> {
+    let bytes = dev.as_bytes();
+    if bytes.is_empty() || bytes.len() >= libc::IFNAMSIZ {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad interface name {dev}")));
+    }
+    let r = unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, bytes.as_ptr() as *const libc::c_void, bytes.len() as libc::socklen_t) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("SO_BINDTODEVICE {dev}: {e}")));
+    }
+    Ok(())
 }
 
 pub fn if_nametoindex(name: &str) -> io::Result<i32> {

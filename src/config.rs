@@ -3,9 +3,11 @@
 
 use crate::consts::*;
 use crate::crypto::{AesBackend, AuthMode, CipherMode};
+use crate::endpoint::EndpointSpec;
 use crate::types::{ProgramMode, RawMode, Syscalls};
 use clap::Parser;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug, Default)]
 #[command(name = "udp2raw", disable_help_flag = true, disable_version_flag = true, no_binary_name = true)]
@@ -89,8 +91,30 @@ struct Cli {
     random_drop: Option<u32>,
     #[arg(long = "easy-tcp")]
     easy_tcp: bool,
+    /// Accepted for compatibility; a hostname in -r always resolves.
     #[arg(long = "dns-resolve")]
     dns_resolve: bool,
+    /// DNS server for a hostname -r, `ip` or `ip:port` (repeatable, tried in order).
+    #[arg(long = "dns-server")]
+    dns_server: Vec<String>,
+    /// Per-server DNS timeout in milliseconds.
+    #[arg(long = "dns-timeout")]
+    dns_timeout: Option<u64>,
+    /// Native interface for DNS queries and relay traffic (`SO_BINDTODEVICE` + host routes).
+    #[arg(long = "underlay-dev")]
+    underlay_dev: Option<String>,
+    /// Gateway on the underlay for the relay's host routes (default: learned from the route to the bootstrap address).
+    #[arg(long = "underlay-gateway")]
+    underlay_gateway: Option<String>,
+    /// Accept RFC 1918 / CGNAT addresses from DNS.
+    #[arg(long = "allow-private-endpoint")]
+    allow_private_endpoint: bool,
+    /// Last-known-good address file for a hostname -r (`none` disables).
+    #[arg(long = "endpoint-cache")]
+    endpoint_cache: Option<String>,
+    /// Literal IPv4 to start with when DNS and the cache are both unavailable.
+    #[arg(long = "bootstrap-addr")]
+    bootstrap_addr: Option<String>,
     #[arg(long = "simple-rule")]
     simple_rule: bool,
     #[arg(long)]
@@ -120,7 +144,19 @@ pub enum LowerLevel {
 pub struct Config {
     pub mode: ProgramMode,
     pub local_addr: SocketAddr,
+    /// The address in use at startup. For a hostname `-r` this is `0.0.0.0:port` until the
+    /// first resolution in `main` replaces it; the client tracks later changes itself.
     pub remote_addr: SocketAddr,
+    /// What `-r` said: a literal or a hostname to keep resolving.
+    pub remote: EndpointSpec,
+    /// `--dns-server`, in order.
+    pub dns_servers: Vec<SocketAddr>,
+    pub dns_timeout_ms: u64,
+    pub underlay_dev: Option<String>,
+    pub underlay_gateway: Option<Ipv4Addr>,
+    pub allow_private_endpoint: bool,
+    pub endpoint_cache: Option<PathBuf>,
+    pub bootstrap_addr: Option<Ipv4Addr>,
     pub key: String,
     pub raw_mode: RawMode,
     /// `--raw-mode easy-faketcp` / `--easy-tcp`: use a kernel TCP socket for the 3-way handshake.
@@ -219,6 +255,16 @@ other options:
     --disable-bpf                         disable the kernel space filter,most time its not necessary
                                           unless you suspect there is a bug
     --dev                 <string>        bind raw socket to a device, not necessary but improves performance
+    -r host:port          (client)        a hostname is resolved through --dns-server at startup and again at
+                                          every reconnect (see README, Hostname endpoints); server -r is numeric
+    --dns-server          <ip[:port]>     DNS server for a hostname -r; repeat to add more (tried in order)
+    --dns-timeout         <ms>            per-server DNS timeout (default 2000)
+    --underlay-dev        <string>        native interface for DNS and relay traffic: SO_BINDTODEVICE on the
+                                          sockets and a /32 route per relay address (implies --dev if unset)
+    --underlay-gateway    <ip>            next hop on --underlay-dev for those routes (default: learned)
+    --allow-private-endpoint              accept RFC 1918 / CGNAT addresses from DNS
+    --endpoint-cache      <path|none>     last-known-good address file (default /var/lib/udp2raw/endpoint_<host>_<port>)
+    --bootstrap-addr      <ip>            address to start with if DNS and the cache are both unavailable
     --sock-buf            <number>        buf size for socket,>=10 and <=10240,unit:kbyte,default:1024
     --force-sock-buf                      bypass system limitation while setting sock-buf
     --seq-mode            <number>        seq increase mode for faketcp:
@@ -306,6 +352,17 @@ fn parse_socket_addr(s: &str, what: &str) -> Result<SocketAddr, String> {
     Ok(a)
 }
 
+/// `ip` or `ip:port` / `[ipv6]:port` for `--dns-server`; the port defaults to 53.
+fn parse_dns_server(s: &str) -> Result<SocketAddr, String> {
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 53));
+    }
+    Err(format!("invalid --dns-server {s}, expected ip or ip:port"))
+}
+
 fn parse_mac(s: &str) -> Result<[u8; 6], String> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 6 {
@@ -359,7 +416,49 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         return Err("error: -c /-s  hasnt been set".into());
     };
     let local_addr = parse_socket_addr(cli.local.as_deref().ok_or("error: -l not found")?, "-l")?;
-    let remote_addr = parse_socket_addr(cli.remote.as_deref().ok_or("error: -r not found")?, "-r")?;
+    let remote_str = cli.remote.as_deref().ok_or("error: -r not found")?;
+    let remote = if mode == ProgramMode::Client {
+        EndpointSpec::parse(remote_str).map_err(|e| format!("invalid parameter for -r ,{e}"))?
+    } else if remote_str.parse::<SocketAddr>().is_ok() {
+        EndpointSpec::Literal(parse_socket_addr(remote_str, "-r")?)
+    } else {
+        return Err(format!("invalid parameter for -r ,{remote_str},server -r must be ip:port or [ipv6]:port (hostnames are supported for the client only)"));
+    };
+    if remote.port() == 22 {
+        return Err("port 22 not allowed".into());
+    }
+    let remote_addr = match &remote {
+        EndpointSpec::Literal(a) => *a,
+        EndpointSpec::Hostname { port, .. } => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *port),
+    };
+    let mut dns_servers = Vec::new();
+    for s in &cli.dns_server {
+        dns_servers.push(parse_dns_server(s)?);
+    }
+    if remote.is_dynamic() && dns_servers.is_empty() {
+        return Err("-r with a hostname needs at least one --dns-server".into());
+    }
+    let dns_timeout_ms = cli.dns_timeout.unwrap_or(2000);
+    if !(100..=30_000).contains(&dns_timeout_ms) {
+        return Err("--dns-timeout must be between 100 and 30000 ms".into());
+    }
+    let underlay_gateway = match &cli.underlay_gateway {
+        Some(g) => Some(g.parse::<Ipv4Addr>().map_err(|_| format!("--underlay-gateway {g} is not an ipv4 address"))?),
+        None => None,
+    };
+    if underlay_gateway.is_some() && cli.underlay_dev.is_none() {
+        return Err("--underlay-gateway needs --underlay-dev".into());
+    }
+    let bootstrap_addr = match &cli.bootstrap_addr {
+        Some(b) => Some(b.parse::<Ipv4Addr>().map_err(|_| format!("--bootstrap-addr {b} is not an ipv4 address"))?),
+        None => None,
+    };
+    let endpoint_cache = match (&cli.endpoint_cache, &remote) {
+        (Some(p), _) if p == "none" || p.is_empty() => None,
+        (Some(p), _) => Some(PathBuf::from(p)),
+        (None, EndpointSpec::Hostname { name, port }) => Some(PathBuf::from(format!("/var/lib/udp2raw/endpoint_{name}_{port}"))),
+        (None, EndpointSpec::Literal(_)) => None,
+    };
 
     let (mut raw_mode, mut easy) = (RawMode::FakeTcp, false);
     if let Some(s) = &cli.raw_mode {
@@ -468,6 +567,14 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         mode,
         local_addr,
         remote_addr,
+        remote,
+        dns_servers,
+        dns_timeout_ms,
+        underlay_dev: cli.underlay_dev.clone(),
+        underlay_gateway,
+        allow_private_endpoint: cli.allow_private_endpoint,
+        endpoint_cache,
+        bootstrap_addr,
         key: cli.key.clone().unwrap_or_else(|| "secret key".to_string()),
         raw_mode,
         easy_faketcp: easy,
@@ -527,6 +634,54 @@ mod tests {
         assert_eq!(parse_conf_line("# comment").unwrap(), Vec::<String>::new());
         assert_eq!(parse_conf_line("").unwrap(), Vec::<String>::new());
         assert!(parse_conf_line("aaa").is_err());
+    }
+
+    #[test]
+    fn hostname_endpoint_options() {
+        let out = parse_args(&args("-c -l 127.0.0.1:7000 -r hk1b-udp2raw.clement.hk:8443 --dns-server 223.5.5.5 --dns-server 223.6.6.6:53 --underlay-dev eth0 --underlay-gateway 192.168.1.1 --bootstrap-addr 47.243.1.1")).unwrap();
+        let ParseOutcome::Run(cfg) = out else { panic!() };
+        assert_eq!(cfg.remote, EndpointSpec::Hostname { name: "hk1b-udp2raw.clement.hk".into(), port: 8443 });
+        assert_eq!(cfg.remote_addr.to_string(), "0.0.0.0:8443");
+        assert!(!cfg.raw_is_v6());
+        assert_eq!(cfg.dns_servers, vec!["223.5.5.5:53".parse::<SocketAddr>().unwrap(), "223.6.6.6:53".parse().unwrap()]);
+        assert_eq!(cfg.dns_timeout_ms, 2000);
+        assert_eq!(cfg.underlay_dev.as_deref(), Some("eth0"));
+        assert_eq!(cfg.underlay_gateway, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(cfg.bootstrap_addr, Some(Ipv4Addr::new(47, 243, 1, 1)));
+        assert_eq!(cfg.endpoint_cache.as_deref(), Some(std::path::Path::new("/var/lib/udp2raw/endpoint_hk1b-udp2raw.clement.hk_8443")));
+        assert!(!cfg.allow_private_endpoint);
+        // numeric -r: unchanged behaviour, no cache, no dns
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r 47.243.1.1:8443")).unwrap() else { panic!() };
+        assert_eq!(cfg.remote, EndpointSpec::Literal("47.243.1.1:8443".parse().unwrap()));
+        assert_eq!(cfg.remote_addr.to_string(), "47.243.1.1:8443");
+        assert!(cfg.dns_servers.is_empty());
+        assert!(cfg.endpoint_cache.is_none());
+        // ipv6 literal still works for the client
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r [2001:db8::1]:8443")).unwrap() else { panic!() };
+        assert!(cfg.raw_is_v6());
+        // options
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache none --dns-timeout 500 --allow-private-endpoint")).unwrap() else { panic!() };
+        assert!(cfg.endpoint_cache.is_none());
+        assert_eq!(cfg.dns_timeout_ms, 500);
+        assert!(cfg.allow_private_endpoint);
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache /tmp/x")).unwrap() else { panic!() };
+        assert_eq!(cfg.endpoint_cache.as_deref(), Some(std::path::Path::new("/tmp/x")));
+        // errors
+        for bad in [
+            "-c -l 127.0.0.1:7000 -r relay.example:8443",                                   // no dns server
+            "-c -l 127.0.0.1:7000 -r relay.example:22 --dns-server 1.1.1.1",              // port 22
+            "-c -l 127.0.0.1:7000 -r relay.example --dns-server 1.1.1.1",                 // no port
+            "-c -l 127.0.0.1:7000 -r bad_name.example:8443 --dns-server 1.1.1.1",         // underscore
+            "-c -l 127.0.0.1:7000 -r -relay.example:8443 --dns-server 1.1.1.1",           // leading hyphen
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server not-an-ip",          // bad server
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --dns-timeout 5",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --underlay-gateway 192.168.1.1",  // gateway without dev
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr nope",
+            "-s -l 0.0.0.0:8443 -r relay.example:7777",                                    // server: numeric only
+            "-s -l 0.0.0.0:8443 -r 127.0.0.1:22",
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
