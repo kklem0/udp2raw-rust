@@ -2,10 +2,11 @@
 # End-to-end tests over loopback inside the dev container (needs --cap-add NET_RAW,NET_ADMIN).
 #
 #   docker build -t udp2raw-rust-dev tools/docker
-#   docker run --rm --cap-add NET_RAW --cap-add NET_ADMIN \
+#   docker run --rm --cap-add NET_RAW --cap-add NET_ADMIN --cap-add SYS_ADMIN \
 #       -v "$PWD":/work -v /path/to/udp2raw-cpp:/cpp:ro \
 #       -v udp2raw-cargo:/usr/local/cargo/registry -v udp2raw-target:/work/target-linux \
 #       udp2raw-rust-dev tools/docker/e2e.sh [quick]
+#   (SYS_ADMIN is only needed for the veth/network-namespace cases; ONLY=<regex> runs a subset)
 #
 # Topology (everything on 127.0.0.1):
 #   udp_probe -> :3333 (client -l) ==raw tunnel==> :4096 (server -l) -> :7777 (udp_echo, server -r)
@@ -62,6 +63,7 @@ wait_for() { # pattern file timeout
 #   noa: do not pass -a (easy-faketcp relies on the kernel's own TCP handshake)
 run_case() {
     local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6 probe=${7:-"2000 1000 2"} noa=${8:-}
+    if [ -n "${ONLY:-}" ] && ! [[ "$name" =~ ${ONLY} ]]; then return; fi
     local A="-a"; [ "$noa" = noa ] && A=""
     echo "== case: $name"
     python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
@@ -95,14 +97,20 @@ veth_setup() {
     ip netns del peer 2>/dev/null; ip link del veth0 2>/dev/null
     ip netns add peer && ip link add veth0 type veth peer name veth1 && ip link set veth1 netns peer || return 1
     ip addr add 10.99.0.1/24 dev veth0 && ip link set veth0 up
-    ip netns exec peer ip addr add 10.99.0.2/24 dev veth1 && ip netns exec peer ip link set veth1 up && ip netns exec peer ip link set lo up
-    ping -c1 -W1 10.99.0.2 >/dev/null 2>&1; ip netns exec peer ping -c1 -W1 10.99.0.1 >/dev/null 2>&1   # populate ARP
+    ip netns exec peer ip addr add 10.99.0.2/24 dev veth1 && ip netns exec peer ip link set veth1 up && ip netns exec peer ip link set lo up || return 1
+    # static ARP entries both ways (no ping in the image); --lower-level auto reads /proc/net/arp
+    local mac0 mac1
+    mac0=$(cat /sys/class/net/veth0/address); mac1=$(ip netns exec peer cat /sys/class/net/veth1/address)
+    ip neigh replace 10.99.0.2 lladdr "$mac1" dev veth0 nud permanent || return 1
+    ip netns exec peer ip neigh replace 10.99.0.1 lladdr "$mac0" dev veth1 nud permanent || return 1
+    return 0
 }
 veth_teardown() { ip netns del peer 2>/dev/null; ip link del veth0 2>/dev/null; }
 run_veth_case() {
     local name=$1 sbin=$2 cbin=$3 common=$4 sargs=$5 cargs=$6
+    if [ -n "${ONLY:-}" ] && ! [[ "$name" =~ ${ONLY} ]]; then return; fi
     echo "== case: $name (veth)"
-    if ! veth_setup; then echo "   veth setup failed"; FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; return; fi
+    if ! veth_setup 2> "$LOGDIR/$name.veth.log"; then echo "   veth setup failed: $(tail -1 "$LOGDIR/$name.veth.log")"; FAIL=$((FAIL + 1)); FAILED_NAMES="$FAILED_NAMES $name"; return; fi
     ip netns exec peer python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
     ip netns exec peer $sbin -s -l 10.99.0.2:4096 -r 127.0.0.1:7777 -k pw -a $common $sargs > "$LOGDIR/$name.server.log" 2>&1 & pids+=($!)
     sleep 0.5

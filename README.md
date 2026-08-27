@@ -106,8 +106,8 @@ handoff. With two workers the I/O thread's syscalls become the limit
 ```sh
 cargo test                                   # unit tests + golden vectors (any OS)
 docker build -t udp2raw-rust-dev tools/docker
-docker run --rm --cap-add NET_RAW --cap-add NET_ADMIN -v "$PWD":/work \
-    -v /path/to/udp2raw-cpp:/cpp:ro udp2raw-rust-dev tools/docker/e2e.sh   # loopback tunnels + C++ interop
+docker run --rm --cap-add NET_RAW --cap-add NET_ADMIN --cap-add SYS_ADMIN -v "$PWD":/work \
+    -v /path/to/udp2raw-cpp:/cpp:ro udp2raw-rust-dev tools/docker/e2e.sh   # loopback + veth tunnels, C++ interop
 ```
 
 `tests/data/vectors.txt` holds 1,754 records produced by the unmodified C++ code
