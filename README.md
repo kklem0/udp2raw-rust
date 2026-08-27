@@ -24,6 +24,15 @@ What is different from the C++ version:
 * No per-packet `/dev/urandom` reads, no per-packet heap churn in the hot path, and the
   code is memory-safe — it runs as root / with `CAP_NET_RAW` and parses untrusted packets.
 
+* **`--cipher-mode chacha20poly1305`** (Rust↔Rust only): a real AEAD, and the fast choice
+  on CPUs without AES instructions (NEON ChaCha20). `--auth-mode` is ignored in this mode;
+  anti-replay stays on. Both ends must run this port.
+* **`--unit-test`** runs a built-in self-test: key derivation against the C++ reference,
+  every cipher/auth mode on every AES backend the CPU offers, framing and checksums — handy
+  right after copying a binary to a new box.
+* The I/O thread uses `recvmmsg`/`sendmmsg` (one syscall per batch of up to 32/64 packets),
+  pooled buffers and in-place crypto; the C++ does one syscall and several copies per packet.
+
 Everything else — `--raw-mode faketcp|udp|icmp|easy-faketcp`, `--cipher-mode`,
 `--auth-mode`, `-a/-g/--gen-add/--keep-rule/--clear`, `--fix-gro`, `--seq-mode`,
 `--lower-level`, `--source-ip/--source-port`, `--conf-file`, `--fifo`, `--dev`,

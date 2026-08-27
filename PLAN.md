@@ -99,22 +99,19 @@ Threading model (the reason for the port):
 
 ## Known gaps / ideas (in rough priority order)
 
-* ~~Batch the worker handoff~~ done (`77276c9`), plus the busy-poll fix (`8f1b17b`); see the
-  Docker benchmark section.
-* **`recvmmsg`/`sendmmsg` batching** on the I/O thread (`net/raw.rs`, client/server drain
-  loops) — now the measured bottleneck with two workers (I/O thread at 100 % around 265k
-  pps in the container); batching cuts syscalls ~8-30×. TPACKET_V3 ring for RX later.
-* **Buffer pooling**: jobs allocate `Vec<u8>` per packet; recycle through the completion
-  path.
-* `Crypto::encrypt/decrypt` copy the input once; could work in place on the job buffer.
+Done since the first hand-off: worker handoff batching (`77276c9`), busy-poll fix
+(`8f1b17b`), `recvmmsg`/`sendmmsg` on the I/O thread with pooled buffers and in-place
+crypto (`1a7fd3b`), `--cipher-mode chacha20poly1305` (AEAD, Rust↔Rust), a real
+`--unit-test`, e2e coverage for `easy-faketcp` and for `--lower-level auto` over a veth
+pair in a network namespace (also C++ interop across it).
+
+* **Measure again** (not yet done on purpose): the batched-syscall build on the Pi 4, the
+  deployment shape (Pi client ↔ VPS server over eth0), and the Pi 5. `bench.sh quick` in
+  Docker is the ~1 min regression check; `tools/bench/run_fixed_pi.sh` the user/sys CPU split.
+* TPACKET_V3 ring for RX; write headers into headroom of the job buffer to drop the last
+  copy on the TX path.
 * CBC decrypt already batches blocks (`decrypt_blocks`); CBC encrypt is inherently serial.
-* New AEAD mode (e.g. ChaCha20-Poly1305) for the Pi 4 — needs a wire-format extension on
-  both ends; keep it behind a new `--cipher-mode` name so stock peers are unaffected.
-* `--lower-level` has only been type-checked, not run (needs a real L2 path, not loopback).
-* `easy-faketcp` client mode ported but not exercised by the e2e (the kernel completes
-  the handshake; verify against the C++ server on real hardware).
-* `--unit-test` prints a pointer to `cargo test` instead of running the C++'s ad-hoc tests.
-* IPv6 e2e (`-l [::1]:4096`) needs `ip6tables` in the container; add a case.
+* IPv6 e2e (`-l [::1]:4096`) — needs `ip6tables` in the container; not needed for now.
 * The fifo only supports `reconnect` (same as the C++).
 * Logging goes to stdout with the C++ format; `--log-position` prints file:line.
 
