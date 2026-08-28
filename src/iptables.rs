@@ -90,6 +90,32 @@ pub fn pattern_for(cfg: &Config, remote: SocketAddr) -> String {
     }
 }
 
+fn listing_has_jump(output: &str, chain: &str, pattern: &str) -> bool {
+    fn normalized(token: &str) -> &str {
+        token.strip_suffix("/32").or_else(|| token.strip_suffix("/128")).unwrap_or(token)
+    }
+
+    let expected: Vec<&str> = pattern.split_whitespace().collect();
+    output.lines().any(|line| {
+        // iptables-save canonicalizes host matches as /32 or /128, while the command
+        // pattern uses a plain address. Require every generated match token, including the
+        // protocol and port/type, in order before the exact private-chain jump. iptables may
+        // insert explicit `-m` module tokens, so equality of the whole token sequence would
+        // be too strict.
+        let actual: Vec<&str> = line.split_whitespace().collect();
+        let Some(jump) = actual.windows(2).position(|pair| pair[0] == "-j" && pair[1] == chain) else {
+            return false;
+        };
+        let mut next = 0usize;
+        for token in &actual[..jump] {
+            if next < expected.len() && normalized(token) == normalized(expected[next]) {
+                next += 1;
+            }
+        }
+        next == expected.len()
+    })
+}
+
 /// `--clear`: remove every rule and chain this program ever added.
 pub fn clear_all(cfg: &Config) {
     let cmd = base_command(cfg);
@@ -141,16 +167,29 @@ impl Iptables {
         let cmd = base_command(cfg);
         let chains = [format!("udp2rawDwrW_{const_id:x}_C0"), format!("udp2rawDwrW_{const_id:x}_C1")];
         let it = Iptables { cmd, chains, keep, keep_index: AtomicUsize::new(0), patterns: Mutex::new(Vec::new()) };
+        // Record the desired jump before construction so a partial initialization can use
+        // `clear` to roll back every step that did succeed.
+        it.patterns.lock().unwrap().push(pattern.to_string());
         for i in 0..=(keep as usize) {
-            run_command(&format!("{}-N {}", it.cmd, it.chains[i]), true);
-            run_command(&format!("{}-F {}", it.cmd, it.chains[i]), true);
-            run_command(&format!("{}-I {} -j DROP", it.cmd, it.chains[i]), true);
+            // `-N` may legitimately fail when recovering a chain left by an interrupted
+            // initialization. Flushing it is the authoritative existence/permission check.
+            run_command(&format!("{}-N {}", it.cmd, it.chains[i]), false);
+            let flush = format!("{}-F {}", it.cmd, it.chains[i]);
+            if !run_command(&flush, true).0 {
+                it.clear();
+                return Err(io::Error::other(format!("auto added iptables failed by: {flush}")));
+            }
+            let drop = format!("{}-I {} -j DROP", it.cmd, it.chains[i]);
+            if !run_command(&drop, true).0 {
+                it.clear();
+                return Err(io::Error::other(format!("auto added iptables failed by: {drop}")));
+            }
             let add = it.jump_add(i, pattern);
             if !run_command(&add, true).0 {
+                it.clear();
                 return Err(io::Error::other(format!("auto added iptables failed by: {add}")));
             }
         }
-        it.patterns.lock().unwrap().push(pattern.to_string());
         log::warn!("auto added iptables rules");
         Ok(it)
     }
@@ -183,13 +222,56 @@ impl Iptables {
         Ok(())
     }
 
-    /// Remove the INPUT jumps of one match pattern (from both chains, however many times
-    /// they were added). Unknown patterns are ignored.
-    pub fn del_pattern(&self, pattern: &str) {
+    /// Reconcile a rule whose deletion result was uncertain before an endpoint became
+    /// desired again. A successful listing is authoritative: an exact active-chain jump is
+    /// present, or stale in-memory bookkeeping is removed so the normal add path can restore
+    /// it. If listing is unavailable, make one availability-first insert attempt instead of
+    /// treating either the listing failure or stale bookkeeping as proof of presence.
+    ///
+    /// `Ok(true)` means the jump is now known present, `Ok(false)` means it is known absent
+    /// and prepared for [`add_pattern`](Self::add_pattern), and `Err` leaves it unknown.
+    pub fn reconcile_pattern(&self, pattern: &str) -> io::Result<bool> {
+        self.reconcile_pattern_with(pattern, run_command)
+    }
+
+    fn reconcile_pattern_with<F>(&self, pattern: &str, mut command: F) -> io::Result<bool>
+    where
+        F: FnMut(&str, bool) -> (bool, String),
+    {
         let mut pats = self.patterns.lock().unwrap();
-        let Some(pos) = pats.iter().position(|p| p == pattern) else { return };
-        pats.remove(pos);
-        for i in 0..2 {
+        let list = format!("{}-S INPUT", self.cmd);
+        let (listed, output) = command(&list, false);
+        if listed {
+            if listing_has_jump(&output, &self.chains[self.active_chain()], pattern) {
+                if !pats.iter().any(|p| p == pattern) {
+                    pats.push(pattern.to_string());
+                }
+                return Ok(true);
+            }
+            pats.retain(|p| p != pattern);
+            return Ok(false);
+        }
+
+        let add = self.jump_add(self.active_chain(), pattern);
+        if !command(&add, true).0 {
+            return Err(io::Error::other(format!(
+                "iptables could neither list nor restore an uncertain endpoint rule: {list}; {add}"
+            )));
+        }
+        if !pats.iter().any(|p| p == pattern) {
+            pats.push(pattern.to_string());
+        }
+        log::warn!("iptables: listing unavailable; inserted one availability-first rule [{pattern}]");
+        Ok(true)
+    }
+
+    /// Remove the INPUT jumps of one match pattern (from every managed chain, however many
+    /// times they were added). Bookkeeping is retained until `iptables -S` verifies that the
+    /// jump is absent, allowing a transient deletion failure to be retried later.
+    pub fn del_pattern(&self, pattern: &str) -> io::Result<()> {
+        let mut pats = self.patterns.lock().unwrap();
+        let Some(pos) = pats.iter().position(|p| p == pattern) else { return Ok(()) };
+        for i in 0..=(self.keep as usize) {
             let del = self.jump_del(i, pattern);
             for _ in 0..4 {
                 if !run_command(&del, false).0 {
@@ -197,7 +279,23 @@ impl Iptables {
                 }
             }
         }
+        let list = format!("{}-S INPUT", self.cmd);
+        let (ok, output) = run_command(&list, false);
+        if !ok {
+            return Err(io::Error::other(format!("iptables could not verify rule cleanup: {list}")));
+        }
+        for i in 0..=(self.keep as usize) {
+            let expected = format!("-A INPUT {pattern} -j {}", self.chains[i]);
+            let still_present = listing_has_jump(&output, &self.chains[i], pattern);
+            if still_present {
+                return Err(io::Error::other(format!(
+                    "iptables rule cleanup is still pending: {expected}"
+                )));
+            }
+        }
+        pats.remove(pos);
         log::info!("iptables: removed rule [{pattern}]");
+        Ok(())
     }
 
     pub fn patterns(&self) -> Vec<String> {
@@ -276,5 +374,80 @@ mod tests {
         assert_eq!(pattern(&u), "-s 47.243.1.1 -p udp -m udp --sport 8443");
         let s = cfg("-s -l 0.0.0.0:8443 -r 127.0.0.1:51820");
         assert_eq!(pattern(&s), "-p tcp -m tcp --dport 8443");
+    }
+
+    #[test]
+    fn cleanup_listing_match_tolerates_iptables_normalization() {
+        let chain = "udp2rawDwrW_123_C0";
+        let pattern = "-s 47.243.1.1 -p icmp --icmp-type 0";
+        let listing = "-A INPUT -s 47.243.1.1/32 -p icmp -m icmp --icmp-type 0 -j udp2rawDwrW_123_C0\n";
+        assert!(listing_has_jump(listing, chain, pattern));
+        assert!(!listing_has_jump(listing, chain, "-s 47.243.1.2 -p icmp --icmp-type 0"));
+        assert!(!listing_has_jump(listing, "udp2rawDwrW_456_C0", pattern));
+
+        let tcp_pattern = "-s 47.243.1.1 -p tcp -m tcp --sport 8443";
+        let wrong_port = "-A INPUT -s 47.243.1.1/32 -p tcp -m tcp --sport 9443 -j udp2rawDwrW_123_C0\n";
+        let wrong_protocol = "-A INPUT -s 47.243.1.1/32 -p udp -m udp --sport 8443 -j udp2rawDwrW_123_C0\n";
+        assert!(!listing_has_jump(wrong_port, chain, tcp_pattern));
+        assert!(!listing_has_jump(wrong_protocol, chain, tcp_pattern));
+    }
+
+    fn reconciliation_fixture(pattern: &str) -> Iptables {
+        Iptables {
+            cmd: "iptables ".to_string(),
+            chains: ["udp2rawDwrW_123_C0".to_string(), "udp2rawDwrW_123_C1".to_string()],
+            keep: false,
+            keep_index: AtomicUsize::new(0),
+            patterns: Mutex::new(vec![pattern.to_string()]),
+        }
+    }
+
+    #[test]
+    fn uncertain_rule_reconciliation_uses_listing_not_stale_bookkeeping() {
+        let pattern = "-s 47.243.1.1 -p tcp -m tcp --sport 8443";
+        let present = reconciliation_fixture(pattern);
+        let listing = "-A INPUT -s 47.243.1.1/32 -p tcp -m tcp --sport 8443 -j udp2rawDwrW_123_C0\n";
+        assert!(present
+            .reconcile_pattern_with(pattern, |cmd, _| {
+                assert!(cmd.contains("-S INPUT"));
+                (true, listing.to_string())
+            })
+            .unwrap());
+        assert_eq!(present.patterns(), vec![pattern]);
+
+        let absent = reconciliation_fixture(pattern);
+        assert!(!absent
+            .reconcile_pattern_with(pattern, |cmd, _| {
+                assert!(cmd.contains("-S INPUT"));
+                (true, String::new())
+            })
+            .unwrap());
+        assert!(absent.patterns().is_empty(), "verified absence must clear stale add bookkeeping");
+    }
+
+    #[test]
+    fn unavailable_rule_listing_gets_one_real_restore_attempt() {
+        let pattern = "-s 47.243.1.1 -p tcp -m tcp --sport 8443";
+        let restored = reconciliation_fixture(pattern);
+        let mut calls = Vec::new();
+        assert!(restored
+            .reconcile_pattern_with(pattern, |cmd, show_log| {
+                calls.push((cmd.to_string(), show_log));
+                if cmd.contains("-S INPUT") {
+                    (false, String::new())
+                } else {
+                    (true, String::new())
+                }
+            })
+            .unwrap());
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].0.contains("-I INPUT"));
+        assert!(calls[1].1);
+
+        let unknown = reconciliation_fixture(pattern);
+        assert!(unknown
+            .reconcile_pattern_with(pattern, |_, _| (false, String::new()))
+            .is_err());
+        assert_eq!(unknown.patterns(), vec![pattern], "failed verification and restore must remain unknown");
     }
 }

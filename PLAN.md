@@ -7,7 +7,7 @@ crypto extensions). The C++ daemon pegs one core well before the link is saturat
 This file is the hand-off document: what exists, how it is verified, what is left, and
 how to test on the Pis. Keep the **Status** section current.
 
-## Status (2026-08-27)
+## Status (2026-08-29)
 
 | Area | State |
 |---|---|
@@ -20,7 +20,8 @@ how to test on the Pis. Keep the **Status** section current.
 | Server (many clients, conv sockets, connection recovery, GC) | done |
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done (per-endpoint rules for a hostname `-r`) |
-| Hostname client `-r` + in-process relay switching (`--dns-server`, `--underlay-dev`, netlink `/32` routes, endpoint cache) | done on `feat/dns-endpoint-reresolve` — unit + namespace integration tests |
+| Hostname client `-r` + in-process relay switching (`--dns-server`, `--underlay-dev`, netlink `/32` routes, endpoint cache) | implemented and verified from a unique fresh Linux/arm64 release build; namespace suite **118/118 pass (pass=118, fail=0)** on 2026-08-29 |
+| Authenticated last-good rollback | smallest-safe v1 implemented, explicitly opt-in/default-off: committed-good and probationary stay distinct, blind probes are durably pre-charged, and healthy Ready sessions are never disrupted for automatic convergence; fresh Linux/arm64 namespace suite **118/118 pass (pass=118, fail=0)** on 2026-08-29 |
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
 | Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below |
 | Pi 5 measurements (same box swapped to a Pi 5; hardware AES + mmsg confirmed by auto-detection) | **done 2026-08-28** — see "Raspberry Pi 5" below; a two-box measurement still to do |
@@ -70,6 +71,10 @@ Threading model (the reason for the port):
 
 ## Verification so far
 
+* Hardened fallback validation (2026-08-29): macOS `--all-targets --all-features`
+  passed 119 library + 1 binary + 3 vector tests, `cargo check`, and strict Clippy;
+  Linux/arm64 passed 146 library + 1 binary + 3 vector tests, `cargo check`, and strict
+  Clippy from a unique fresh target directory.
 * `cargo test` on macOS: 42 unit tests + `tests/vectors.rs` (golden vectors) pass.
 * `cargo check --target aarch64-unknown-linux-gnu --all-targets`: clean.
 * Docker (`rust:1-bookworm`, arm64, `--cap-add NET_RAW,NET_ADMIN`): `tools/docker/e2e.sh`
@@ -77,6 +82,162 @@ Threading model (the reason for the port):
   loopback with `-a` in every raw mode, cipher/auth combos, `--fix-gro`, `--threads 0/3`,
   and C++↔Rust in both directions, probing 2,000 datagrams on 2 convs plus a throughput
   blast. Results are logged at the end of this file.
+* `tools/docker/dns_reresolve_test.sh` now contains isolated-namespace scenarios for DNS
+  rotation and resolver loss, continuous traffic during healthy fallback, attended bad
+  cutover/direct rollback, correctly keyed black-hole probation, PID/listener continuity,
+  and two clients sharing independently owned protocol-235 `/32` routes/rules. It builds in
+  a unique empty target directory and has a failure-injection check that a failed Cargo build
+  cannot run a stale artifact. **The complete suite passed 118/118 (pass=118, fail=0) on
+  Linux/arm64 from the script's unique fresh release build on 2026-08-29.**
+
+## Hostname endpoint / fallback v1 hand-off
+
+This is deliberately the smallest availability-first version. `--last-good-fallback` is off
+by default; tuning flags do not enable it. Opt-in requires a hostname client `-r`, an enabled
+owner-only `--endpoint-cache`, and `--fifo`. Literal endpoints and hostname deployments that
+do not opt in retain their prior endpoint-selection behavior. All FIFO users now receive the
+separate owner-only/no-follow control-channel hardening described below.
+
+### State machine and operator authority
+
+1. DNS produces candidates, never proof of health. Resolver answers are policy-validated,
+   deduplicated, sorted numerically and capped at eight. Continuity may keep the current or
+   committed address first; DNS wire order is otherwise irrelevant.
+2. The cache identifies **committed-good**, the durable rollback point. Startup `saved=` age
+   and live health are separate: an authenticated handshake and every accepted authenticated
+   heartbeat/DATA packet refresh monotonic runtime health. A tunnel carrying such traffic can
+   remain eligible beyond the 24-hour default startup-cache age.
+3. A different, correctly keyed relay that authenticates is only **probationary**. Its single
+   handshake cannot rewrite the cache or release committed-good's native route/rule.
+4. Ready state does not query merely because TTL expires, and never tears down a healthy
+   fallback on a timer. Resolution occurs at startup or a reconnect boundary. Automatic
+   destructive five-minute migration is not part of v1.
+5. `echo reconnect > <fifo>` is attended and may interrupt once. It performs one bounded
+   fresh preferred attempt only when the old endpoint can remain eligible through the
+   attempt. An unauthenticated candidate returns directly to the preserved endpoint without
+   consuming a blind-probe token.
+6. The existing external gateway health collector or operator sends an endpoint-qualified
+   verdict: `promote <candidate-ip>` or `rollback <candidate-ip>`. A stale address cannot act
+   on a later probation.
+
+Promotion requires the named address to be the active authenticated probationary candidate;
+at least three accepted inbound authenticated DATA packets for a live conversation;
+first-to-last evidence span at least `--last-good-fallback-probation`; no inter-packet gap and
+no current evidence staleness greater than `min(probation, 5 s)` (a larger gap resets the
+run); and a successful durable cache write. When a safe automatic rollback deadline exists,
+promotion must also precede it while committed-good is still eligible. Handshake packets,
+heartbeats and DATA for unknown conversations do not count. If stale startup history could
+not support a safe deadline, the old cache/resources remain preserved and explicit promotion
+after full DATA evidence is allowed, but no automatic destructive rollback is scheduled.
+A matching `rollback` or safe probation deadline returns only while committed-good is
+eligible. Attended-origin returns to the endpoint that was working immediately beforehand
+are direct. Startup/automatic probation returns are blind probes that must first consume the
+durable per-set and global budgets; denial never tears down a still-live candidate.
+
+### DNS and elapsed-time bounds
+
+Each configured resolver must return at least one usable address before it suppresses the
+next resolver; an unsafe-only answer from resolver one falls through to resolver two. Public
+IPv4 is required unless `--allow-private-endpoint` explicitly permits RFC 1918/CGNAT; unsafe
+special ranges remain forbidden everywhere, including cache and sidecar input.
+
+One resolver pass has a 10-second total deadline across every server and UDP/TCP retry, or
+`min(10 s, preferred_round_timeout)` with fallback enabled. The preferred-candidate round has
+its own overall deadline (default 30 s), so up to eight canonical candidates cannot multiply
+per-server/per-handshake time without bound. Failed resolution preserves the current and
+last usable state and enters backoff.
+
+### Persistence and crash contract
+
+The endpoint cache remains text-compatible: strict `host=`, `port=`, `addr=`, optional
+`saved=` and the existing optional comment. A legacy document without `saved=` may bootstrap
+a total DNS outage, but is startup-only evidence until it authenticates again. Input is one
+canonical document of at most 4 KiB with exact hostname/port and a safe canonical address.
+
+All cache, sidecar and lock paths require a regular effective-uid-owned file, exact `0600`
+mode and link count one. Symlinks, hard links, FIFOs and devices are rejected. The containing
+directory may be created, then must be a real effective-uid-owned directory without
+group/world write permission; symlink/replacement races are revalidated. Atomic writes use a
+128-bit-CSPRNG same-directory create-new `O_NOFOLLOW` temporary, validate metadata, write
+fully, `fsync` the file, rename, then `fsync` the directory.
+
+The command FIFO is an operator authority and is also strict: a new FIFO is mode `0600`; a
+pre-existing FIFO must be effective-uid-owned, exactly `0600`, and have one link. It is opened
+relative to the trusted parent with `O_NOFOLLOW`. Symlinks, other file types, unsafe parents
+and raced replacements fail startup, so custom FIFOs belong in a dedicated non-writable
+directory below `/run`, not directly in a shared writable directory.
+
+`<cache>.fallback-state` is a strict maximum-16-KiB v1 document protected by the stable
+owner-only `<cache>.fallback-state.lock`. Under that cross-process lock, the process reloads
+state and persists the charge *before* starting a blind old-IP probe. A crash therefore
+cannot refund the attempt. Each entry is keyed by hostname, port, canonical DNS set and old
+candidate, with its own configured cap/cooldown. A persisted global bucket (default four
+tokens, one refill per 900 s) spans changing sets. The table holds at most 16 charged keys
+and refuses a 17th rather than evicting history. Restart, answer reordering and DNS-set churn
+cannot mint attempts. Unsafe/unreadable/unwritable state disables unattended fallback
+fail-closed; it does not erase an already-authorized rollback or the endpoint-qualified
+direct return from an attended cutover.
+
+### Kernel ownership and timing guard
+
+Route and iptables-rule state are tracked, installed, removed and retried independently every
+five seconds for the active and retained rollback endpoints. Rule existence or an unavailable
+rule listing is never used as proof of the route. Failed deletion remains in cleanup
+bookkeeping for retry. Re-retaining an endpoint after an unconfirmed delete leaves that
+resource unknown until an exact kernel query proves presence or absence. Route reconciliation
+matches the complete IPv4 main-table `/32` + protocol 235 + unicast + gateway/interface/
+preferred-source/metric identity; rule reconciliation matches every generated token and the
+active private-chain jump. Verified absence is recreated, an inconclusive result retries, and
+an unavailable rule listing triggers one real availability-first insert attempt rather than
+a false success. Protocol-235 routes use create-exclusive per-process metrics and exact
+deletion keys, so two clients and an operator route can share a relay `/32` without deleting
+each other.
+
+Configuration must satisfy:
+
+```text
+rollback_window > connection-loss detection (10 s)
+                + preferred_round_timeout
+                + one handshake timeout (5 s)
+                + probation
+                + two timer intervals (2 × 400 ms)
+```
+
+The defaults are 300 s versus a required 75.8 s. A second runtime-freshness check is made at
+each attended cutover. The formula is a guard against scheduling an interruption after its
+return path expires; activity-based freshness remains authoritative.
+
+### Failure table
+
+| input / failure | v1 behavior | state/resource consequence |
+|---|---|---|
+| TTL/DNS changes while committed-good is healthy | Stay Ready; no convergence probe | No outage or state change |
+| Attended candidate is down/wrong-key | Directly return to just-working endpoint | Cache/old route/rule preserved; no blind token charge |
+| Keyed candidate handshakes then black-holes traffic | Remain probationary; reject promotion; collector rolls back | Previous rollback point remains durable and routed |
+| Startup/automatic probation needs the old address | Return only after locked durable pre-charge; keep a live candidate if denied | Consume per-set/cooldown and global limits before probing old |
+| Candidate has sustained DATA and matching promotion | Persist, then commit | Release old resources only after cache success |
+| All preferred candidates fail unattended | After threshold plus one bounded turn/deadline, locked pre-charge may permit old-IP probe | Per-set cooldown/cap and global token consumed before I/O |
+| Resolver one returns only unusable addresses | Continue to resolver two within overall deadline | Does not replace last usable candidates |
+| Resolver/all-round deadline expires | Stop extending this round; retry later with backoff | Preserve committed state and budgets |
+| Crash/restart or churning answer sets | Reload durable locked charges/global bucket | No retry-budget refund/reset |
+| Cache/sidecar metadata, type, identity, size or content is unsafe | Reject input; blind fallback fails closed | Never follow/overwrite unsafe objects |
+| Route/rule operation fails | Retry independently; retain failed cleanup; exact-reconcile an uncertain deletion before re-retaining it | Peer-client and operator routes remain owned separately |
+
+### Deliberately deferred
+
+Automatic migration from a healthy fallback is deferred. It is acceptable for v1 to require
+an attended FIFO cutover and explicit health-collector promotion. Future convergence work
+must use a genuinely independent parallel socket/session, make-before-break selection and
+measured packet-loss bounds; periodic destructive probing is not an acceptable substitute.
+Runtime-health timestamps also remain process-local; restart falls back to strict cache age
+until re-authentication. There is no automatic sidecar/schema migration: a configuration
+change such as lowering capacity below persisted tokens fails closed and requires a reviewed,
+attended migration rather than silently resetting/refunding limits. The 16-key table likewise
+refuses new keys when full instead of evicting charged history. Rtnetlink exposes no
+per-process route owner cookie; cooperating clients use an exclusive random metric plus the
+exact native-path tuple as the ownership token. Distinguishing a process that deliberately
+recreates that identical tuple during a lost-ACK window would require a future cross-process
+lease registry or a different kernel tagging scheme.
 
 ## Next session: verification on the Pis
 

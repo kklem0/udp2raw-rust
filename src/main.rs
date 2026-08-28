@@ -122,10 +122,40 @@ mod linux {
     /// Client: decide the relay address to start with (DNS, then the cache, then
     /// `--bootstrap-addr`) and keep the controller for later re-resolution.
     fn bootstrap_endpoint(cfg: &mut Config) -> Result<EndpointController, i32> {
-        let opts = EndpointOptions { allow_private: cfg.allow_private_endpoint, cache_file: cfg.endpoint_cache.clone(), bootstrap: cfg.bootstrap_addr, ..EndpointOptions::default() };
-        let dns = DnsConfig { servers: cfg.dns_servers.clone(), device: cfg.underlay_dev.clone(), timeout: Duration::from_millis(cfg.dns_timeout_ms) };
+        let opts = EndpointOptions {
+            allow_private: cfg.allow_private_endpoint,
+            cache_file: cfg.endpoint_cache.clone(),
+            bootstrap: cfg.bootstrap_addr,
+            last_good_fallback: cfg.last_good_fallback.clone(),
+            ..EndpointOptions::default()
+        };
+        let dns_overall_timeout_ms = if cfg.last_good_fallback.enabled {
+            cfg.last_good_fallback.preferred_round_timeout_ms.min(10_000)
+        } else {
+            10_000
+        };
+        let dns = DnsConfig {
+            servers: cfg.dns_servers.clone(),
+            device: cfg.underlay_dev.clone(),
+            timeout: Duration::from_millis(cfg.dns_timeout_ms),
+            overall_timeout: Duration::from_millis(dns_overall_timeout_ms),
+            allow_private: cfg.allow_private_endpoint,
+        };
         if cfg.remote.is_dynamic() {
             log::info!("endpoint: resolving {} through {:?}{} (timeout {} ms, cache {})", cfg.remote, cfg.dns_servers, cfg.underlay_dev.as_deref().map_or(String::new(), |d| format!(" via {d}")), cfg.dns_timeout_ms, cfg.endpoint_cache.as_deref().map_or("off".to_string(), |p| p.display().to_string()));
+            let p = &cfg.last_good_fallback;
+            log::info!(
+                "endpoint: authenticated-last-good fallback {} (after {} failed DNS handshakes, max {} pre-charged probes per answer, global capacity {}, cooldown {:.1}s, round {:.1}s, probation {:.1}s, rollback {:.1}s, startup-cache max age {:.1}s)",
+                if p.enabled { "enabled" } else { "disabled" },
+                p.after_failures,
+                p.max_attempts,
+                p.global_capacity,
+                p.cooldown_ms as f64 / 1000.0,
+                p.preferred_round_timeout_ms as f64 / 1000.0,
+                p.probation_ms as f64 / 1000.0,
+                p.rollback_window_ms as f64 / 1000.0,
+                p.max_age_ms as f64 / 1000.0
+            );
         }
         loop {
             match EndpointController::bootstrap(cfg.remote.clone(), Box::new(Resolver { cfg: dns.clone() }), opts.clone(), now_ms()) {

@@ -14,6 +14,7 @@ pub mod dns;
 pub mod endpoint;
 pub mod logging;
 pub mod packet;
+pub mod secure_file;
 pub mod selftest;
 pub mod types;
 pub mod util;

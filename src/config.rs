@@ -3,7 +3,8 @@
 
 use crate::consts::*;
 use crate::crypto::{AesBackend, AuthMode, CipherMode};
-use crate::endpoint::EndpointSpec;
+use crate::dns::check_endpoint_ip;
+use crate::endpoint::{EndpointSpec, LastGoodFallbackPolicy};
 use crate::types::{ProgramMode, RawMode, Syscalls};
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -119,6 +120,36 @@ struct Cli {
     /// Literal IPv4 to start with when DNS and the cache are both unavailable.
     #[arg(long = "bootstrap-addr")]
     bootstrap_addr: Option<String>,
+    /// Enable bounded authenticated last-known-good rollback for hostname endpoints.
+    #[arg(long = "last-good-fallback")]
+    last_good_fallback: bool,
+    /// Failed DNS-candidate handshake cycles before probing authenticated last-good.
+    #[arg(long = "last-good-fallback-after")]
+    last_good_fallback_after: Option<u32>,
+    /// Failed last-good probes allowed per unchanged DNS answer.
+    #[arg(long = "last-good-fallback-max-attempts")]
+    last_good_fallback_max_attempts: Option<u32>,
+    /// Seconds before another failed last-good probe is permitted.
+    #[arg(long = "last-good-fallback-cooldown")]
+    last_good_fallback_cooldown: Option<u64>,
+    /// Maximum age in seconds of a cached authentication proof used for fallback.
+    #[arg(long = "last-good-fallback-max-age")]
+    last_good_fallback_max_age: Option<u64>,
+    /// Global persisted old-address probe capacity across changing DNS answers.
+    #[arg(long = "last-good-fallback-global-attempts")]
+    last_good_fallback_global_attempts: Option<u32>,
+    /// Seconds required to refill one persisted global old-address probe token.
+    #[arg(long = "last-good-fallback-global-refill")]
+    last_good_fallback_global_refill: Option<u64>,
+    /// Overall seconds allowed for one preferred DNS candidate handshake round.
+    #[arg(long = "last-good-fallback-round-timeout")]
+    last_good_fallback_round_timeout: Option<u64>,
+    /// Minimum span of authenticated payload evidence before FIFO promotion is accepted.
+    #[arg(long = "last-good-fallback-probation")]
+    last_good_fallback_probation: Option<u64>,
+    /// Maximum seconds the previous committed endpoint remains available for rollback.
+    #[arg(long = "last-good-fallback-rollback-window")]
+    last_good_fallback_rollback_window: Option<u64>,
     #[arg(long = "simple-rule")]
     simple_rule: bool,
     #[arg(long)]
@@ -161,6 +192,7 @@ pub struct Config {
     pub allow_private_endpoint: bool,
     pub endpoint_cache: Option<PathBuf>,
     pub bootstrap_addr: Option<Ipv4Addr>,
+    pub last_good_fallback: LastGoodFallbackPolicy,
     pub key: String,
     pub raw_mode: RawMode,
     /// `--raw-mode easy-faketcp` / `--easy-tcp`: use a kernel TCP socket for the 3-way handshake.
@@ -266,8 +298,8 @@ other options:
     --disable-bpf                         disable the kernel space filter,most time its not necessary
                                           unless you suspect there is a bug
     --dev                 <string>        bind raw socket to a device, not necessary but improves performance
-    -r host:port          (client)        a hostname is resolved through --dns-server at startup and again at
-                                          every reconnect (see README, Hostname endpoints); server -r is numeric
+    -r host:port          (client)        a hostname is resolved through --dns-server at startup and again when
+                                          TTL expires at reconnect or refresh is forced; server -r is numeric
     --dns-server          <ip[:port]>     DNS server for a hostname -r; repeat to add more (tried in order)
     --dns-timeout         <ms>            per-server DNS timeout (default 2000)
     --underlay-dev        <string>        native interface for DNS and relay traffic: SO_BINDTODEVICE on the
@@ -276,6 +308,22 @@ other options:
     --allow-private-endpoint              accept RFC 1918 / CGNAT addresses from DNS
     --endpoint-cache      <path|none>     last-known-good address file (default /var/lib/udp2raw/endpoint_<host>_<port>)
     --bootstrap-addr      <ip>            address to start with if DNS and the cache are both unavailable
+    --last-good-fallback                  opt in to bounded authenticated last-good rollback (default off;
+                                          requires a hostname, --endpoint-cache and --fifo)
+    --last-good-fallback-after <count>    failed DNS-candidate handshakes before trying recent last-good (default 3)
+    --last-good-fallback-max-attempts <count>
+                                          pre-charged old-address probes per unchanged DNS answer (default 2)
+    --last-good-fallback-cooldown <sec>   delay between failed old-address probes (default 300)
+    --last-good-fallback-max-age <sec>    maximum cache age eligible for fallback (default 86400)
+    --last-good-fallback-global-attempts <count>
+                                          persisted token capacity across changing DNS answers (default 4)
+    --last-good-fallback-global-refill <sec>
+                                          seconds to refill one global probe token (default 900)
+    --last-good-fallback-round-timeout <sec>
+                                          overall preferred-candidate handshake deadline (default 30)
+    --last-good-fallback-probation <sec>  authenticated payload evidence span before promotion (default 30)
+    --last-good-fallback-rollback-window <sec>
+                                          maximum probation/rollback window (default 300)
     --sock-buf            <number>        buf size for socket,>=10 and <=10240,unit:kbyte,default:1024
     --force-sock-buf                      bypass system limitation while setting sock-buf
     --seq-mode            <number>        seq increase mode for faketcp:
@@ -404,6 +452,22 @@ fn parse_mac(s: &str) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
+fn bounded_u32(name: &str, value: u32, min: u32, max: u32) -> Result<u32, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be between {min} and {max}"))
+    }
+}
+
+fn bounded_u64(name: &str, value: u64, min: u64, max: u64) -> Result<u64, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be between {min} and {max}"))
+    }
+}
+
 pub enum ParseOutcome {
     Run(Box<Config>),
     Help,
@@ -451,7 +515,9 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
     } else if remote_str.parse::<SocketAddr>().is_ok() {
         EndpointSpec::Literal(parse_socket_addr(remote_str, "-r")?)
     } else {
-        return Err(format!("invalid parameter for -r ,{remote_str},server -r must be ip:port or [ipv6]:port (hostnames are supported for the client only)"));
+        return Err(format!(
+            "invalid parameter for -r ,{remote_str},server -r must be ip:port or [ipv6]:port (hostnames are supported for the client only)"
+        ));
     };
     if remote.port() == 22 {
         return Err("port 22 not allowed".into());
@@ -479,7 +545,14 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         return Err("--underlay-gateway needs --underlay-dev".into());
     }
     let bootstrap_addr = match &cli.bootstrap_addr {
-        Some(b) => Some(b.parse::<Ipv4Addr>().map_err(|_| format!("--bootstrap-addr {b} is not an ipv4 address"))?),
+        Some(b) => {
+            let ip = b
+                .parse::<Ipv4Addr>()
+                .map_err(|_| format!("--bootstrap-addr {b} is not an ipv4 address"))?;
+            check_endpoint_ip(ip, cli.allow_private_endpoint)
+                .map_err(|why| format!("unsafe --bootstrap-addr {b}: {why}"))?;
+            Some(ip)
+        }
         None => None,
     };
     let endpoint_cache = match (&cli.endpoint_cache, &remote) {
@@ -487,6 +560,55 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         (Some(p), _) => Some(PathBuf::from(p)),
         (None, EndpointSpec::Hostname { name, port }) => Some(PathBuf::from(format!("/var/lib/udp2raw/endpoint_{name}_{port}"))),
         (None, EndpointSpec::Literal(_)) => None,
+    };
+    let fallback_tuning_present = cli.last_good_fallback_after.is_some()
+        || cli.last_good_fallback_max_attempts.is_some()
+        || cli.last_good_fallback_cooldown.is_some()
+        || cli.last_good_fallback_max_age.is_some()
+        || cli.last_good_fallback_global_attempts.is_some()
+        || cli.last_good_fallback_global_refill.is_some()
+        || cli.last_good_fallback_round_timeout.is_some()
+        || cli.last_good_fallback_probation.is_some()
+        || cli.last_good_fallback_rollback_window.is_some();
+    if fallback_tuning_present && !cli.last_good_fallback {
+        return Err("last-good fallback tuning requires explicit --last-good-fallback opt-in".into());
+    }
+    if cli.last_good_fallback {
+        if !remote.is_dynamic() {
+            return Err("--last-good-fallback requires a hostname -r".into());
+        }
+        if endpoint_cache.is_none() {
+            return Err("--last-good-fallback requires an owner-only --endpoint-cache for persistent limits".into());
+        }
+        if cli.fifo.is_none() {
+            return Err("--last-good-fallback requires --fifo for attended promotion and rollback".into());
+        }
+    }
+    let probation_ms = bounded_u64("--last-good-fallback-probation", cli.last_good_fallback_probation.unwrap_or(30), 1, 86_400)?.saturating_mul(1000);
+    let rollback_window_ms = bounded_u64("--last-good-fallback-rollback-window", cli.last_good_fallback_rollback_window.unwrap_or(300), 2, 7 * 86_400)?.saturating_mul(1000);
+    let preferred_round_timeout_ms = bounded_u64("--last-good-fallback-round-timeout", cli.last_good_fallback_round_timeout.unwrap_or(30), 5, 600)?.saturating_mul(1000);
+    let required_rollback_ms = CLIENT_CONN_TIMEOUT_MS
+        .saturating_add(preferred_round_timeout_ms)
+        .saturating_add(CLIENT_HANDSHAKE_TIMEOUT_MS)
+        .saturating_add(probation_ms)
+        .saturating_add(2 * TIMER_INTERVAL_MS);
+    if cli.last_good_fallback && required_rollback_ms >= rollback_window_ms {
+        return Err(format!(
+            "--last-good-fallback-rollback-window must exceed connection-loss detection + preferred round + one handshake + probation + two timer intervals ({:.1}s)",
+            required_rollback_ms as f64 / 1000.0
+        ));
+    }
+    let last_good_fallback = LastGoodFallbackPolicy {
+        enabled: cli.last_good_fallback,
+        after_failures: bounded_u32("--last-good-fallback-after", cli.last_good_fallback_after.unwrap_or(3), 1, 100)?,
+        max_attempts: bounded_u32("--last-good-fallback-max-attempts", cli.last_good_fallback_max_attempts.unwrap_or(2), 1, 100)?,
+        cooldown_ms: bounded_u64("--last-good-fallback-cooldown", cli.last_good_fallback_cooldown.unwrap_or(300), 1, 86_400)?.saturating_mul(1000),
+        max_age_ms: bounded_u64("--last-good-fallback-max-age", cli.last_good_fallback_max_age.unwrap_or(86_400), 1, 31 * 86_400)?.saturating_mul(1000),
+        global_capacity: bounded_u32("--last-good-fallback-global-attempts", cli.last_good_fallback_global_attempts.unwrap_or(4), 1, 100)?,
+        global_refill_ms: bounded_u64("--last-good-fallback-global-refill", cli.last_good_fallback_global_refill.unwrap_or(900), 1, 7 * 86_400)?.saturating_mul(1000),
+        preferred_round_timeout_ms,
+        probation_ms,
+        rollback_window_ms,
     };
 
     let (mut raw_mode, mut easy) = (RawMode::FakeTcp, false);
@@ -539,7 +661,10 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         Some(s) if s == "auto" => Some(LowerLevel::Auto),
         Some(s) => {
             let (if_name, mac) = s.split_once('#').ok_or("lower-level parameter invaild,check help page for format")?;
-            Some(LowerLevel::Manual { if_name: if_name.to_string(), dest_mac: parse_mac(mac)? })
+            Some(LowerLevel::Manual {
+                if_name: if_name.to_string(),
+                dest_mac: parse_mac(mac)?,
+            })
         }
     };
     let hb_mode = cli.hb_mode.unwrap_or(1);
@@ -614,6 +739,7 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         allow_private_endpoint: cli.allow_private_endpoint,
         endpoint_cache,
         bootstrap_addr,
+        last_good_fallback,
         key,
         raw_mode,
         easy_faketcp: easy,
@@ -682,20 +808,28 @@ mod tests {
         let kf = dir.join("k");
         let base = "-c -l 127.0.0.1:3333 -r 1.2.3.4:4096";
         std::fs::write(&kf, b"filekey\n").unwrap(); // trailing newline stripped
-        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else {
+            panic!()
+        };
         assert_eq!(cfg.key, "filekey");
         // -k still works, default preserved
-        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} -k plainkey"))).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} -k plainkey"))).unwrap() else {
+            panic!()
+        };
         assert_eq!(cfg.key, "plainkey");
         let ParseOutcome::Run(cfg) = parse_args(&args(base)).unwrap() else { panic!() };
         assert_eq!(cfg.key, "secret key");
         // CRLF stripped
         std::fs::write(&kf, b"crlfkey\r\n").unwrap();
-        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else {
+            panic!()
+        };
         assert_eq!(cfg.key, "crlfkey");
         // key with an embedded space (only the newline is stripped, not inner whitespace)
         std::fs::write(&kf, b"a b c\n").unwrap();
-        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else {
+            panic!()
+        };
         assert_eq!(cfg.key, "a b c");
         // errors: both, missing, empty
         assert!(parse_args(&args(&format!("{base} -k x --key-file {}", kf.display()))).is_err());
@@ -708,9 +842,18 @@ mod tests {
 
     #[test]
     fn hostname_endpoint_options() {
-        let out = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example.com:8443 --dns-server 223.5.5.5 --dns-server 223.6.6.6:53 --underlay-dev eth0 --underlay-gateway 192.168.1.1 --bootstrap-addr 47.243.1.1")).unwrap();
+        let out = parse_args(&args(
+            "-c -l 127.0.0.1:7000 -r relay.example.com:8443 --dns-server 223.5.5.5 --dns-server 223.6.6.6:53 --underlay-dev eth0 --underlay-gateway 192.168.1.1 --bootstrap-addr 47.243.1.1",
+        ))
+        .unwrap();
         let ParseOutcome::Run(cfg) = out else { panic!() };
-        assert_eq!(cfg.remote, EndpointSpec::Hostname { name: "relay.example.com".into(), port: 8443 });
+        assert_eq!(
+            cfg.remote,
+            EndpointSpec::Hostname {
+                name: "relay.example.com".into(),
+                port: 8443
+            }
+        );
         assert_eq!(cfg.remote_addr.to_string(), "0.0.0.0:8443");
         assert!(!cfg.raw_is_v6());
         assert_eq!(cfg.dns_servers, vec!["223.5.5.5:53".parse::<SocketAddr>().unwrap(), "223.6.6.6:53".parse().unwrap()]);
@@ -719,35 +862,83 @@ mod tests {
         assert_eq!(cfg.underlay_gateway, Some(Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(cfg.bootstrap_addr, Some(Ipv4Addr::new(47, 243, 1, 1)));
         assert_eq!(cfg.endpoint_cache.as_deref(), Some(std::path::Path::new("/var/lib/udp2raw/endpoint_relay.example.com_8443")));
+        assert_eq!(cfg.last_good_fallback, LastGoodFallbackPolicy::default());
         assert!(!cfg.allow_private_endpoint);
         // numeric -r: unchanged behaviour, no cache, no dns
-        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r 47.243.1.1:8443")).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r 47.243.1.1:8443")).unwrap() else {
+            panic!()
+        };
         assert_eq!(cfg.remote, EndpointSpec::Literal("47.243.1.1:8443".parse().unwrap()));
         assert_eq!(cfg.remote_addr.to_string(), "47.243.1.1:8443");
         assert!(cfg.dns_servers.is_empty());
         assert!(cfg.endpoint_cache.is_none());
         // ipv6 literal still works for the client
-        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r [2001:db8::1]:8443")).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r [2001:db8::1]:8443")).unwrap() else {
+            panic!()
+        };
         assert!(cfg.raw_is_v6());
         // options
-        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache none --dns-timeout 500 --allow-private-endpoint")).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args(
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache none --dns-timeout 500 --allow-private-endpoint",
+        ))
+        .unwrap() else {
+            panic!()
+        };
         assert!(cfg.endpoint_cache.is_none());
         assert_eq!(cfg.dns_timeout_ms, 500);
         assert!(cfg.allow_private_endpoint);
-        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache /tmp/x")).unwrap() else { panic!() };
+        let ParseOutcome::Run(cfg) = parse_args(&args(
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --allow-private-endpoint --bootstrap-addr 10.0.0.1",
+        ))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(cfg.bootstrap_addr, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache /tmp/x")).unwrap() else {
+            panic!()
+        };
         assert_eq!(cfg.endpoint_cache.as_deref(), Some(std::path::Path::new("/tmp/x")));
+        let ParseOutcome::Run(cfg) = parse_args(&args("-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --endpoint-cache /tmp/x --fifo /tmp/f --last-good-fallback --last-good-fallback-after 4 --last-good-fallback-max-attempts 2 --last-good-fallback-cooldown 7 --last-good-fallback-max-age 13 --last-good-fallback-global-attempts 3 --last-good-fallback-global-refill 17 --last-good-fallback-round-timeout 5 --last-good-fallback-probation 2 --last-good-fallback-rollback-window 30")).unwrap() else { panic!() };
+        assert_eq!(
+            cfg.last_good_fallback,
+            LastGoodFallbackPolicy {
+                enabled: true,
+                after_failures: 4,
+                max_attempts: 2,
+                cooldown_ms: 7_000,
+                max_age_ms: 13_000,
+                global_capacity: 3,
+                global_refill_ms: 17_000,
+                preferred_round_timeout_ms: 5_000,
+                probation_ms: 2_000,
+                rollback_window_ms: 30_000,
+            }
+        );
         // errors
         for bad in [
-            "-c -l 127.0.0.1:7000 -r relay.example:8443",                                   // no dns server
-            "-c -l 127.0.0.1:7000 -r relay.example:22 --dns-server 1.1.1.1",              // port 22
-            "-c -l 127.0.0.1:7000 -r relay.example --dns-server 1.1.1.1",                 // no port
-            "-c -l 127.0.0.1:7000 -r bad_name.example:8443 --dns-server 1.1.1.1",         // underscore
-            "-c -l 127.0.0.1:7000 -r -relay.example:8443 --dns-server 1.1.1.1",           // leading hyphen
-            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server not-an-ip",          // bad server
+            "-c -l 127.0.0.1:7000 -r relay.example:8443",                         // no dns server
+            "-c -l 127.0.0.1:7000 -r relay.example:22 --dns-server 1.1.1.1",      // port 22
+            "-c -l 127.0.0.1:7000 -r relay.example --dns-server 1.1.1.1",         // no port
+            "-c -l 127.0.0.1:7000 -r bad_name.example:8443 --dns-server 1.1.1.1", // underscore
+            "-c -l 127.0.0.1:7000 -r -relay.example:8443 --dns-server 1.1.1.1",   // leading hyphen
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server not-an-ip",  // bad server
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --dns-timeout 5",
-            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --underlay-gateway 192.168.1.1",  // gateway without dev
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --underlay-gateway 192.168.1.1", // gateway without dev
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr nope",
-            "-s -l 0.0.0.0:8443 -r relay.example:7777",                                    // server: numeric only
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr 127.0.0.1",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr 10.0.0.1",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback-after 0",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback-max-attempts 101",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback-cooldown 0",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback-probe-interval 0",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback-max-age 0",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback --fifo /tmp/f --endpoint-cache none",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback --endpoint-cache /tmp/x",
+            "-c -l 127.0.0.1:7000 -r 47.243.1.1:8443 --last-good-fallback --endpoint-cache /tmp/x --fifo /tmp/f",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback --endpoint-cache /tmp/x --fifo /tmp/f --last-good-fallback-probation 10 --last-good-fallback-rollback-window 10",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback --endpoint-cache /tmp/x --fifo /tmp/f --last-good-fallback-round-timeout 30 --last-good-fallback-rollback-window 30",
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --last-good-fallback --endpoint-cache /tmp/x --fifo /tmp/f --last-good-fallback-round-timeout 5 --last-good-fallback-probation 2 --last-good-fallback-rollback-window 10",
+            "-s -l 0.0.0.0:8443 -r relay.example:7777", // server: numeric only
             "-s -l 0.0.0.0:8443 -r 127.0.0.1:22",
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad}");
@@ -783,7 +974,10 @@ mod tests {
 
     #[test]
     fn server_v6_and_modes() {
-        let out = parse_args(&args("-s -l [::]:4096 -r 127.0.0.1:7777 --cipher-mode aes128cfb_0 --auth-mode none --raw-mode easy-faketcp --lower-level eth0#00:23:45:67:89:b9 --threads 3 --sock-buf 2048 --seq-mode 4")).unwrap();
+        let out = parse_args(&args(
+            "-s -l [::]:4096 -r 127.0.0.1:7777 --cipher-mode aes128cfb_0 --auth-mode none --raw-mode easy-faketcp --lower-level eth0#00:23:45:67:89:b9 --threads 3 --sock-buf 2048 --seq-mode 4",
+        ))
+        .unwrap();
         let ParseOutcome::Run(c) = out else { panic!() };
         assert_eq!(c.mode, ProgramMode::Server);
         assert!(c.raw_is_v6());
@@ -791,7 +985,13 @@ mod tests {
         assert!(c.cfb_legacy);
         assert!(c.disable_anti_replay, "auth none disables anti-replay");
         assert!(c.easy_faketcp);
-        assert_eq!(c.lower_level, Some(LowerLevel::Manual { if_name: "eth0".into(), dest_mac: [0x00, 0x23, 0x45, 0x67, 0x89, 0xb9] }));
+        assert_eq!(
+            c.lower_level,
+            Some(LowerLevel::Manual {
+                if_name: "eth0".into(),
+                dest_mac: [0x00, 0x23, 0x45, 0x67, 0x89, 0xb9]
+            })
+        );
         assert_eq!(c.threads, 3);
         assert_eq!(c.socket_buf_size, 2048 * 1024);
         assert_eq!(c.seq_mode, 4);
@@ -810,14 +1010,20 @@ mod tests {
     fn aead_keeps_anti_replay_even_with_explicit_auth_none() {
         // regression: `--auth-mode none` (a no-op in AEAD mode) must not disable anti-replay,
         // since the AEAD tag authenticates the sequence number.
-        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --auth-mode none")).unwrap() else { panic!() };
+        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --auth-mode none")).unwrap() else {
+            panic!()
+        };
         assert_eq!(c.auth_mode, AuthMode::None);
         assert!(!c.disable_anti_replay, "AEAD authenticates, so --auth-mode none must not disable anti-replay");
         // --disable-anti-replay is still honoured with an AEAD cipher
-        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --disable-anti-replay")).unwrap() else { panic!() };
+        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --disable-anti-replay")).unwrap() else {
+            panic!()
+        };
         assert!(c.disable_anti_replay);
         // legacy behaviour unchanged: a non-AEAD cipher with --auth-mode none still disables it
-        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode aes128cbc --auth-mode none")).unwrap() else { panic!() };
+        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode aes128cbc --auth-mode none")).unwrap() else {
+            panic!()
+        };
         assert!(c.disable_anti_replay, "no authentication -> anti-replay disabled");
     }
 
@@ -838,7 +1044,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("udp2raw-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.conf");
-        std::fs::write(&path, "# This is client\n-c\n-l 127.0.0.1:56789\n-r 45.66.77.88:45678\n-k my_awesome_password\n--raw-mode faketcp\n--log-level 4\n").unwrap();
+        std::fs::write(
+            &path,
+            "# This is client\n-c\n-l 127.0.0.1:56789\n-r 45.66.77.88:45678\n-k my_awesome_password\n--raw-mode faketcp\n--log-level 4\n",
+        )
+        .unwrap();
         let out = parse_args(&[String::from("--conf-file"), path.to_string_lossy().to_string()]).unwrap();
         let ParseOutcome::Run(c) = out else { panic!() };
         assert_eq!(c.key, "my_awesome_password");
