@@ -36,8 +36,9 @@ What is different from the C++ version:
   24-byte nonce per packet (`[nonce 24][ciphertext][tag 16]`, +40 bytes), so the payload
   carries no counter or constant — it is indistinguishable from random bytes, like the AES
   modes. The cipher only changes the payload: `--raw-mode faketcp|udp|icmp` and `--fix-gro`
-  disguise it exactly as before. `--auth-mode` is ignored in this mode; anti-replay stays
-  on. Both ends must run this port.
+  disguise it exactly as before. `--auth-mode` is ignored in this mode (the AEAD tag
+  authenticates every packet); anti-replay stays on regardless, including with an explicit
+  `--auth-mode none`. Both ends must run this port.
 * **`--unit-test`** runs a built-in self-test: key derivation against the C++ reference,
   every cipher/auth mode on every AES backend the CPU offers, framing and checksums — handy
   right after copying a binary to a new box.
