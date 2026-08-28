@@ -79,8 +79,26 @@ client and server of the same implementation, UDP in one direction through both 
 C++ = stock udp2raw `fb13730`; Rust = this repo. Raw logs and method: `docs/bench/`,
 [PLAN.md](PLAN.md).
 
+**Raspberry Pi 5** (Cortex-A76 ×4 @2.4 GHz, hardware AES + hardware PAN, Ubuntu 24.04), both
+daemons on the Pi over loopback, 2026-08-28. `auto` picks hardware AES and `mmsg` syscalls
+here (logged at startup); thread scaling in the deployed mode:
+
+| | loss-free pps | Mbit/s | server / client CPU | vs C++ |
+|---|---:|---:|---|---:|
+| C++ | 46,028 | 479 | 99 % / 96 % | 1.00× |
+| Rust `--threads 0` | 66,788 | 695 | 94 % / 93 % | 1.45× |
+| Rust `--threads 1` | 72,512 | 754 | 129 % / 114 % | 1.58× |
+| Rust `--threads 2` | 72,640 | 755 | 130 % / 119 % | 1.58× |
+| Rust `--threads 3` | 82,828 | 861 | 139 % / 135 % | 1.80× |
+
+With hardware AES the cipher barely matters (`chacha20poly1305` is 67.9k/77.3k pps at
+`--threads 0`/`2` vs 66.8k/72.6k for aes128cbc+md5 — within ~6 %), and `mmsg` vs `single` is
+a wash (the Pi 4's software-PAN penalty is gone); the table backend is 1.24–1.29× slower than
+hardware AES. All four cores are shared with the generator, so a real one-daemon-per-box
+deployment would scale further. Details: [PLAN.md](PLAN.md).
+
 **Raspberry Pi 4** (Cortex-A72 ×4 @1.8 GHz, no AES instructions, Ubuntu 24.04), both daemons
-on the Pi over loopback, 2026-08-27:
+on the Pi over loopback, 2026-08-27 (before the box was upgraded to a Pi 5):
 
 | | loss-free pps | Mbit/s | server / client CPU | vs C++ |
 |---|---:|---:|---|---:|

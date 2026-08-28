@@ -1,0 +1,65 @@
+# 2026-08-28 12:14-12:2x +08:00 test-site-1, now a Raspberry Pi 5 Model B (Cortex-A76 x4 @2.4GHz, HARDWARE AES/SHA + LSE atomics/hardware PAN, ARMv8.2), Ubuntu 24.04, kernel 6.8.0-1062-raspi.
+# The box at 192.168.1.10 was swapped from a Pi 4 to a Pi 5 (same SD card/rootfs). Still a live router; benchmark used separate loopback ports and never touched production.
+# Both daemons on the box, loopback, 1300-byte datagrams, -a --fix-gro, generator udpbench2 (sendmmsg, 64-packet bursts). No-drop rate = highest offered pps with <=2% loss (binary search, 2s/step, 6 steps).
+# Binaries: cpp  = udp2raw fb13730 stock build (portable-C AES on this build), md5 70454d13
+#           rust = udp2raw-main = /opt/udp2raw-rust-0e0b3fa-arm64 (current main: --syscalls auto, --aes-backend auto, xchacha), md5 fa675245
+# On the A76, auto resolves to: "syscalls: mmsg (cpu has LSE atomics: ARMv8.1+ with hardware PAN)" and "aes backend: hardware (cpu aes instructions: true)" (from the run logs).
+# Driver: tools/bench/run_quick_pi.sh + bench_ndr.sh (rmem/wmem 16MB and governor=performance for the run, restored after; health check appended).
+
+## headline: deployed mode (aes128cbc+md5) vs chacha20poly1305, --threads 0 and 2 (run_quick_pi.sh)
+# 2026-08-28T12:14:33+08:00 host=test-site-1 kernel=6.8.0-1062-raspi ncpu=4 max_khz=2400000 temp=47C load=0.14 0.15 0.18
+# no-drop-rate search hi=150000 secs=2 iter=6 max_loss=0.02 size=1300 bench=./udpbench2
+# cpp=./udp2raw-cpp (70454d13) rust=./udp2raw-main (fa675245) old=/opt/udp2raw-rust-60a36d6-arm64 (47180f1a)
+  ndr-iter cpp_current rate=75000 offered=74975 sent=149952 recv=92557 loss=0.3828 server_cpu=100% client_cpu=99% sys_busy=201% irq=64%
+  ndr-iter cpp_current rate=37500 offered=37470 sent=74944 recv=74944 loss=0.0000 server_cpu=81% client_cpu=76% sys_busy=152% irq=42%
+  ndr-iter cpp_current rate=56250 offered=56223 sent=112448 recv=92716 loss=0.1755 server_cpu=99% client_cpu=99% sys_busy=201% irq=57%
+  ndr-iter cpp_current rate=46875 offered=46848 sent=93696 recv=92055 loss=0.0175 server_cpu=99% client_cpu=96% sys_busy=188% irq=55%
+  ndr-iter cpp_current rate=51562 offered=51551 sent=103104 recv=91996 loss=0.1077 server_cpu=99% client_cpu=99% sys_busy=192% irq=54%
+  ndr-iter cpp_current rate=49218 offered=49207 sent=98432 recv=92974 loss=0.0554 server_cpu=100% client_cpu=99% sys_busy=194% irq=54%
+NDR cpp_current | ndr_pps=46028 mbps=479 size=1300 | server_cpu=99% client_cpu=96% sys_busy=188% sys_irq=55% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=51.2C
+  ndr-iter rust_current_t0 rate=75000 offered=74976 sent=149952 recv=145268 loss=0.0312 server_cpu=99% client_cpu=98% sys_busy=197% irq=78%
+  ndr-iter rust_current_t0 rate=37500 offered=37471 sent=74944 recv=74944 loss=0.0000 server_cpu=55% client_cpu=51% sys_busy=113% irq=40%
+  ndr-iter rust_current_t0 rate=56250 offered=56223 sent=112448 recv=112448 loss=0.0000 server_cpu=82% client_cpu=77% sys_busy=159% irq=65%
+  ndr-iter rust_current_t0 rate=65625 offered=65598 sent=131200 recv=131200 loss=0.0000 server_cpu=93% client_cpu=90% sys_busy=189% irq=70%
+  ndr-iter rust_current_t0 rate=70312 offered=70300 sent=140608 recv=137602 loss=0.0214 server_cpu=97% client_cpu=95% sys_busy=196% irq=79%
+  ndr-iter rust_current_t0 rate=67968 offered=67935 sent=135872 recv=133577 loss=0.0169 server_cpu=94% client_cpu=93% sys_busy=191% irq=76%
+NDR rust_current_t0 | ndr_pps=66788 mbps=695 size=1300 | server_cpu=94% client_cpu=93% sys_busy=191% sys_irq=76% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=51.2C
+  ndr-iter rust_current_t2 rate=75000 offered=74834 sent=149952 recv=136545 loss=0.0894 server_cpu=124% client_cpu=120% sys_busy=259% irq=84%
+  ndr-iter rust_current_t2 rate=37500 offered=37471 sent=74944 recv=74944 loss=0.0000 server_cpu=71% client_cpu=64% sys_busy=148% irq=42%
+  ndr-iter rust_current_t2 rate=56250 offered=56220 sent=112448 recv=112423 loss=0.0002 server_cpu=108% client_cpu=96% sys_busy=194% irq=64%
+  ndr-iter rust_current_t2 rate=65625 offered=65598 sent=131200 recv=131200 loss=0.0000 server_cpu=122% client_cpu=111% sys_busy=217% irq=75%
+  ndr-iter rust_current_t2 rate=70312 offered=70292 sent=140608 recv=140608 loss=0.0000 server_cpu=127% client_cpu=116% sys_busy=230% irq=77%
+  ndr-iter rust_current_t2 rate=72656 offered=72637 sent=145280 recv=145280 loss=0.0000 server_cpu=130% client_cpu=119% sys_busy=231% irq=83%
+NDR rust_current_t2 | ndr_pps=72640 mbps=755 size=1300 | server_cpu=130% client_cpu=119% sys_busy=231% sys_irq=83% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=52.4C
+  ndr-iter rust_chacha_t0 rate=75000 offered=74975 sent=149952 recv=130765 loss=0.1280 server_cpu=99% client_cpu=98% sys_busy=197% irq=81%
+  ndr-iter rust_chacha_t0 rate=37500 offered=37471 sent=74944 recv=74944 loss=0.0000 server_cpu=58% client_cpu=52% sys_busy=102% irq=38%
+  ndr-iter rust_chacha_t0 rate=56250 offered=56221 sent=112448 recv=112448 loss=0.0000 server_cpu=85% client_cpu=78% sys_busy=154% irq=62%
+  ndr-iter rust_chacha_t0 rate=65625 offered=65597 sent=131200 recv=131200 loss=0.0000 server_cpu=96% client_cpu=91% sys_busy=172% irq=72%
+  ndr-iter rust_chacha_t0 rate=70312 offered=70296 sent=140608 recv=137283 loss=0.0236 server_cpu=99% client_cpu=97% sys_busy=183% irq=78%
+  ndr-iter rust_chacha_t0 rate=67968 offered=67933 sent=135872 recv=135872 loss=0.0000 server_cpu=99% client_cpu=94% sys_busy=183% irq=74%
+NDR rust_chacha_t0 | ndr_pps=67936 mbps=707 size=1300 | server_cpu=99% client_cpu=94% sys_busy=183% sys_irq=74% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=52.9C
+  ndr-iter rust_chacha_t2 rate=75000 offered=74708 sent=149696 recv=149696 loss=0.0000 server_cpu=135% client_cpu=121% sys_busy=244% irq=86%
+  ndr-iter rust_chacha_t2 rate=112500 offered=112437 sent=224896 recv=130122 loss=0.4214 server_cpu=126% client_cpu=147% sys_busy=264% irq=105%
+  ndr-iter rust_chacha_t2 rate=93750 offered=93718 sent=187456 recv=144633 loss=0.2284 server_cpu=135% client_cpu=145% sys_busy=270% irq=96%
+  ndr-iter rust_chacha_t2 rate=84375 offered=84294 sent=168704 recv=161343 loss=0.0436 server_cpu=146% client_cpu=139% sys_busy=270% irq=93%
+  ndr-iter rust_chacha_t2 rate=79687 offered=79647 sent=159296 recv=154147 loss=0.0323 server_cpu=137% client_cpu=130% sys_busy=252% irq=90%
+  ndr-iter rust_chacha_t2 rate=77343 offered=77309 sent=154624 recv=154624 loss=0.0000 server_cpu=139% client_cpu=126% sys_busy=248% irq=92%
+NDR rust_chacha_t2 | ndr_pps=77312 mbps=804 size=1300 | server_cpu=139% client_cpu=126% sys_busy=248% sys_irq=92% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=1 temp=52.4C
+# restored rmem_max=212992 wmem_max=212992 governor=ondemand
+# leftover bench processes: 0; udp2raw processes: 972 /opt/udp2raw-rust-0e0b3fa-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2
+# udp2raw-test-site-1.service: active; wg1 latest handshake: 89s ago
+# done 2026-08-28T12:17:34+08:00 temp=52C
+
+## thread scaling: deployed mode (aes128cbc+md5, auto hw+mmsg), --threads 1 and 3 (t0/t2 above)
+# Pi 5 thread scaling, deployed mode (aes128cbc+md5, auto hw+mmsg), hi=150000 secs=2 iter=6
+NDR rust_t1 | ndr_pps=72512 mbps=754 size=1300 | server_cpu=129% client_cpu=114% sys_busy=222% sys_irq=87% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=1 temp=54.5C
+NDR rust_t3 | ndr_pps=82828 mbps=861 size=1300 | server_cpu=139% client_cpu=135% sys_busy=258% sys_irq=97% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=54.5C
+# restored rmem=212992 gov=ondemand; leftover_bench=0; svc=active; wg1=17s
+
+## controls: forcing the Pi-4 code paths to check the auto choices
+# Pi 5 controls, rust=./udp2raw-main, baseline auto=mmsg+hardware; hi=150000 secs=2 iter=6
+NDR rust_t0_single | ndr_pps=65600 mbps=682 size=1300 | server_cpu=97% client_cpu=97% sys_busy=183% sys_irq=75% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=53.5C
+NDR rust_t0_table | ndr_pps=53888 mbps=560 size=1300 | server_cpu=100% client_cpu=99% sys_busy=191% sys_irq=59% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=52.4C
+NDR rust_t2_single | ndr_pps=78539 mbps=817 size=1300 | server_cpu=140% client_cpu=138% sys_busy=265% sys_irq=92% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.03s | warnlines=0 temp=54.5C
+NDR rust_t2_table | ndr_pps=56224 mbps=585 size=1300 | server_cpu=134% client_cpu=120% sys_busy=243% sys_irq=63% (of 400%) | probe: sent=500 received=500 corrupt=0 size=1000 flows=2 ratio=1.0000 elapsed=0.04s | warnlines=1 temp=54.0C
+# restored rmem=212992 gov=ondemand; leftover_bench=0; svc=active; wg1=56s

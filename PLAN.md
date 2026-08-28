@@ -21,8 +21,9 @@ how to test on the Pis. Keep the **Status** section current.
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done |
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
-| Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below; Pi 5 and a two-box measurement still to do |
-| **Production on the Pi 4** (`udp2raw-test-site-1.service`, faketcp client to the VPS, WireGuard inside) | **`0e0b3fa` deployed 2026-08-28 01:28** (`/opt/udp2raw-rust-0e0b3fa-arm64`, unchanged conf, `--syscalls auto` → single); replaced `60a36d6`. See "Deployment" below |
+| Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below |
+| Pi 5 measurements (same box swapped to a Pi 5; hardware AES + mmsg confirmed by auto-detection) | **done 2026-08-28** — see "Raspberry Pi 5" below; a two-box measurement still to do |
+| **Production on `test-site-1`** (`udp2raw-test-site-1.service`, faketcp client to the VPS, WireGuard inside) | **`0e0b3fa`** (`/opt/udp2raw-rust-0e0b3fa-arm64`, unchanged conf; on the Pi 4 `--syscalls auto`→single, now on the Pi 5 →mmsg + hardware AES); replaced `60a36d6`. See "Deployment" below |
 
 Docker e2e results are appended at the bottom of this file after each run.
 
@@ -430,6 +431,69 @@ the Rust daemons only, so the C++ interop cases still run).
 Lesson: on ARMv8.0 cores the expensive part of a syscall is not the entry but every
 user-memory access inside it, so APIs that write per-message bookkeeping back to user space
 lose to the plain calls — measure on the target CPU, not on a stand-in.
+
+## Raspberry Pi 5 (2026-08-28): the same box, hardware AES + mmsg
+
+`test-site-1` was swapped from a Pi 4 to a **Raspberry Pi 5 Model B** (Cortex-A76 x4 @2.4 GHz,
+ARMv8.2 with hardware AES/SHA and LSE atomics/hardware PAN), same SD card, Ubuntu 24.04,
+kernel 6.8.0-1062-raspi. The unchanged binary now auto-detects the *other* code paths:
+`syscalls: mmsg (cpu has LSE atomics ...)` and `aes backend: hardware`. Same loopback setup as
+the Pi 4 quick runs (both daemons on the box, 1300-byte datagrams, `-a --fix-gro`,
+`udpbench2`, no-drop-rate search); raw log `docs/bench/pi5-quick-2026-08-28.txt`. `rust` =
+current `main` (`0e0b3fa`); `cpp` = stock `fb13730` (portable-C AES on that build).
+
+Thread scaling, deployed mode (faketcp + aes128cbc + md5 + `--fix-gro`):
+
+| case | no-drop pps | Mbit/s | server / client CPU | vs C++ |
+|---|---:|---:|---|---:|
+| C++ <-> C++ | 46,028 | 479 | 99 % / 96 % | 1.00x |
+| Rust `--threads 0` | 66,788 | 695 | 94 % / 93 % | 1.45x |
+| Rust `--threads 1` | 72,512 | 754 | 129 % / 114 % | 1.58x |
+| Rust `--threads 2` | 72,640 | 755 | 130 % / 119 % | 1.58x |
+| Rust `--threads 3` | 82,828 | 861 | 139 % / 135 % | 1.80x |
+
+Cipher mode, `--threads 0` / `2` (hardware AES makes the two nearly equal, unlike the Pi 4):
+
+| case | no-drop pps | Mbit/s | server / client CPU |
+|---|---:|---:|---|
+| Rust `--threads 0`, aes128cbc + md5 | 66,788 | 695 | 94 % / 93 % |
+| Rust `--threads 0`, chacha20poly1305 | 67,936 | 707 | 99 % / 94 % |
+| Rust `--threads 2`, aes128cbc + md5 | 72,640 | 755 | 130 % / 119 % |
+| Rust `--threads 2`, chacha20poly1305 | 77,312 | 804 | 139 % / 126 % |
+
+Controls (forcing the Pi-4 code paths to check the auto choices):
+
+| case vs its auto baseline | no-drop pps | note |
+|---|---:|---|
+| `--threads 0`, `--aes-backend table` (vs hardware 66,788) | 53,888 | hardware AES is **1.24x** the table backend |
+| `--threads 2`, `--aes-backend table` (vs hardware 72,640) | 56,224 | hardware AES is **1.29x** |
+| `--threads 0`, `--syscalls single` (vs mmsg 66,788) | 65,600 | mmsg ~= single (+1.8 %) |
+| `--threads 2`, `--syscalls single` (vs mmsg 72,640) | 78,539 | single actually edged mmsg here |
+
+What the numbers say:
+
+* **Auto-detection is correct and now picks the opposite of the Pi 4.** The A76 has hardware
+  AES and hardware PAN, so `--aes-backend auto -> hardware` and `--syscalls auto -> mmsg`,
+  both logged at startup. No config change; the same binary adapts to the CPU.
+* **Hardware AES is the lever on the Pi 5** (1.24-1.29x over the table backend), so the crypto
+  is cheap and **aes128cbc + md5 is within ~6 % of chacha20poly1305** (67.9k vs 66.8k at t0,
+  77.3k vs 72.6k at t2) -- the reverse of the Pi 4, where table-AES made chacha a big win.
+  chacha is still marginally faster and remains the more modern choice, but on hardware AES
+  the cipher barely affects throughput.
+* **mmsg vs single is a wash on the Pi 5** (within ~8 %, and single edged ahead once): the
+  ARMv8.0 software-PAN penalty that made `single` a clear win on the Pi 4 is gone with
+  hardware PAN. `auto` picks `mmsg`; the choice no longer matters much here.
+* **~4-4.5x the Pi 4 in absolute terms** (C++ 46k vs 10k; Rust 67-83k vs 15-19k), from the
+  faster A76 @2.4 GHz plus hardware crypto. Best case: `--threads 2` chacha 77.3k pps
+  (804 Mbit/s) or deployed `--threads 3` 82.8k pps (861 Mbit/s).
+* Same **shared-core caveat** as the Pi 4 quick run: both daemons plus the generator and sink
+  share the 4 cores, so threads add less than one daemon per box would (t1 ~= t2; t3 best),
+  and the numbers are a lower bound for the real deployment (Pi client, traffic over eth0, no
+  loopback triple-processing). The C++ is the portable-C-AES build; a hardware-AES C++ build
+  would narrow the crypto gap but not the batched-drain/threading advantages.
+* Safety: every probe 500/500; after each batch `rmem_max`/`wmem_max` back at 212992 and the
+  governor at `ondemand`, no leftover processes, production daemon active, WireGuard
+  handshaking, temperature <= 55 C.
 
 ## e2e run log
 
