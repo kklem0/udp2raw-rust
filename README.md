@@ -21,8 +21,9 @@ What is different from the C++ version:
   fallback is 2–4× slower for udp2raw's serial CBC encryption. `--aes-backend
   auto|hw|table|fixslice` overrides the choice.
 * **Hostname relay endpoints with in-process switching.** A client `-r host:port` is
-  re-resolved through explicit `--dns-server`s at every reconnect; a new address is adopted
-  without changing the process, the local listener or WireGuard. See "Hostname endpoints".
+  re-resolved through explicit `--dns-server`s when its TTL expires at a reconnect boundary
+  or a refresh is forced; a new address is adopted without changing the process, the local
+  listener or WireGuard. See "Hostname endpoints".
 * **Linux only.** Windows/macOS (the `udp2raw-multiplatform` pcap build) is not ported.
 * No per-packet `/dev/urandom` reads, no per-packet heap churn in the hot path, and the
   code is memory-safe — it runs as root / with `CAP_NET_RAW` and parses untrusted packets.
@@ -111,74 +112,235 @@ The key then never appears in the unit file, the process list, or the logs.
 
 ### Hostname endpoints (client `-r`, in-process relay switching)
 
-A client `-r` may be a hostname. The client resolves it through the DNS servers you give
-with `--dns-server` (never `/etc/resolv.conf`, never `dig`), keeps the connection while it
-is healthy, and when it fails and the client reconnects it re-resolves and, if DNS now
-returns a different address, switches to it **in the same process** — the udp2raw PID, the
-local UDP listener and everything above it (e.g. WireGuard) are untouched. This lets you
-move a relay by changing one DNS record instead of restarting the tunnel.
+A client `-r` may be a hostname. It is resolved only through the explicitly configured
+`--dns-server`s (never `/etc/resolv.conf` or an external command). Switching remains in the
+same process, so the PID and local UDP listener do not change. The conservative v1 policy is
+availability-first: a healthy Ready session is not interrupted merely because its DNS TTL
+expired or DNS now prefers another address. Resolution happens at startup or from a
+reconnect boundary; TTL expiry means the *next* reconnect must refresh the answer.
 
-New client options:
+Options specific to hostname endpoints and rollback:
 
 | option | meaning |
 |---|---|
-| `-r host:port` | resolve `host` (IPv4 `A` records) instead of a literal address; a literal `-r ip:port` is unchanged. Server `-r` stays numeric. |
-| `--dns-server ip[:port]` | resolver to use (default port 53); repeat to add more, tried in order, first usable answer wins. Required with a hostname `-r`. |
-| `--dns-timeout ms` | per-server timeout (default 2000). |
-| `--underlay-dev dev` | native interface for DNS **and** relay traffic: `SO_BINDTODEVICE` on the sockets plus a `/32` host route per relay address, so the lookup and the tunnel take the real link even when the default route is a VPN. Implies `--dev` when `--dev` is unset. |
-| `--underlay-gateway ip` | next hop on `--underlay-dev` for those routes; by default it is learned from the box's existing route to the bootstrap address (on-link if none). |
-| `--allow-private-endpoint` | accept RFC 1918 / CGNAT answers (rejected by default, along with loopback, link-local, multicast, broadcast, reserved and documentation ranges). |
-| `--endpoint-cache path` | file holding the last address whose handshake succeeded (default `/var/lib/udp2raw/endpoint_<host>_<port>`, mode 0600; `none` disables). Used to bootstrap before DNS answers. |
-| `--bootstrap-addr ip` | literal to start with when DNS **and** the cache are both unavailable at startup. |
+| `-r host:port` | Resolve IPv4 `A` records for `host`; literal client endpoints and server `-r` remain numeric and unchanged. |
+| `--dns-server ip[:port]` | Resolver to use (default port 53); repeat to add resolvers in priority order. The first resolver with a policy-valid answer wins. Required with hostname `-r`. |
+| `--dns-timeout ms` | Per-resolver, per-transport timeout (default 2000); the complete resolver pass also has one shared elapsed-time limit. |
+| `--underlay-dev dev` | Bind DNS and relay sockets to the native interface and manage one `/32` route per relay address. Implies `--dev` when unset. |
+| `--underlay-gateway ip` | Next hop on `--underlay-dev`; by default it is learned from the existing route to the bootstrap address (on-link if none). |
+| `--allow-private-endpoint` | Also permit RFC 1918 and CGNAT endpoints. Unspecified, loopback, link-local, multicast, broadcast, reserved, documentation, benchmark and other unsuitable special-purpose ranges remain forbidden. |
+| `--endpoint-cache path` | Committed-good cache (default `/var/lib/udp2raw/endpoint_<host>_<port>`); `none` disables it. |
+| `--bootstrap-addr ip` | Literal start address only when DNS and the cache are both unavailable. |
+| `--last-good-fallback` | Explicitly enable bounded authenticated rollback. It is **off by default** and requires hostname `-r`, an enabled owner-only endpoint cache, and `--fifo`. |
+| `--last-good-fallback-after count` | Failed preferred-candidate handshakes before blind rollback may be considered (default 3); absent the overall round deadline, the canonical candidate set gets a turn first. |
+| `--last-good-fallback-max-attempts count` | Pre-charged old-address probes allowed for one unchanged canonical DNS set and candidate (default 2). |
+| `--last-good-fallback-cooldown sec` | Per-set cooldown between blind old-address probes (default 300). |
+| `--last-good-fallback-max-age sec` | Maximum age of a startup cache timestamp used as fallback proof (default 86400). This does not age out fresh authenticated runtime health. |
+| `--last-good-fallback-global-attempts count` | Persisted global old-address probe token capacity across changing DNS sets (default 4). |
+| `--last-good-fallback-global-refill sec` | Seconds to refill one global token (default 900). |
+| `--last-good-fallback-round-timeout sec` | Overall preferred-candidate round deadline (default 30). |
+| `--last-good-fallback-probation sec` | Minimum sustained authenticated DATA span required before promotion (default 30). |
+| `--last-good-fallback-rollback-window sec` | Maximum health-freshness window in which the prior committed endpoint can be retained for rollback (default 300). |
 
-How it behaves: a DNS answer is only a *candidate* — an address becomes "last-known-good"
-(and is written to the cache) only after the udp2raw authenticated handshake succeeds on it,
-so a poisoned answer cannot redirect the tunnel (the relay still has to prove the key). The
-current address is always tried first and answer order is ignored, so a reordered or
-duplicated answer never causes a switch; a genuinely new address is adopted at the next
-reconnect boundary. Failed queries back off exponentially with jitter, and NXDOMAIN /
-SERVFAIL / timeout / malformed replies / a lost resolver never erase the current endpoint.
-`echo reconnect > <fifo>` forces a fresh query for a planned cutover without restarting.
-TTL is clamped to 10–3600 s; a healthy session is never interrupted by TTL expiry. The
-lookup runs only from the reconnecting (idle) state, never during a healthy session, so it
-cannot stall live traffic; but note a reconnect can take up to `(servers × --dns-timeout)`
-longer while a `--dns-server` is unreachable (the current/last-known address is kept
-throughout).
+Fallback tuning flags without `--last-good-fallback` are rejected; the feature cannot become
+enabled merely because a hostname or cache is present.
 
-**DNS record recommendation:** publish exactly **one** unproxied IPv4 `A` record with a
-**30–60 second TTL**. Keep it a plain A record (no CDN/proxy in front — the tunnel must reach
-the relay's real address), and change the single address to rotate.
+#### State machine: committed-good, candidate and probationary
 
-**Example** (a mainland client, AliDNS resolvers, `eth0` as the native underlay):
+A DNS address is only a candidate. With rollback enabled, the cache names one
+**committed-good** endpoint: the durable rollback point. A different endpoint that completes
+one correctly keyed handshake is only **probationary**. Its handshake proves possession of
+the tunnel key, not that it carries real traffic, so it cannot overwrite the cache or release
+the previous endpoint's native route/rule.
+
+Startup-cache freshness and runtime health are separate clocks. `saved=` is a wall-clock
+proof used when the process starts. Once committed-good authenticates in this process, its
+successful handshake and every accepted authenticated heartbeat or DATA packet refresh
+monotonic runtime health. Thus an endpoint still carrying authenticated traffic remains
+rollback-eligible even when its original handshake and cache entry are older than 24 hours.
+When another endpoint is tried, that last runtime timestamp is frozen and remains eligible
+for at most the configured rollback window.
+
+There is no periodic Ready-state DNS refresh and no destructive five-minute preferred probe.
+A working fallback stays connected until it fails or an operator requests an attended
+cutover. `echo reconnect > <fifo>` is that attended operation: it may interrupt the tunnel
+once, performs one fresh bounded resolution/candidate attempt, and returns directly to the
+preserved committed endpoint if the candidate cannot authenticate. This direct return does
+not consume the blind old-IP budget. Before switching, the client also refuses a cutover
+whose committed endpoint cannot remain rollback-eligible through the round, handshake,
+probation and timer grace.
+
+If the candidate authenticates, both endpoints are retained during probation. A candidate
+from the attended cutover can return directly to the endpoint that was working immediately
+beforehand. Startup- and automatic-origin probation returns are blind old-address probes and
+must first consume the durable per-set and global budgets; if a timed rollback cannot be
+pre-charged, a live probationary candidate is not torn down. No destructive rollback is
+scheduled after committed-good eligibility has expired.
+
+The deployment's external gateway health collector (or an attending operator) is the v1
+promotion authority. FIFO promotion/rollback verdicts are endpoint-qualified so a delayed
+verdict cannot apply to a later candidate:
 
 ```sh
-sudo ./udp2raw -c -l 127.0.0.1:7000 -r relay.example.com:8443 -k "passwd"     --raw-mode faketcp -a --fix-gro     --dns-server 223.5.5.5:53     --dns-server 223.6.6.6:53     --underlay-dev eth0
+echo reconnect > /run/udp2raw.fifo               # fresh DNS + one attended cutover
+echo "promote 47.243.2.40" > /run/udp2raw.fifo  # commit this active candidate
+echo "rollback 47.243.2.40" > /run/udp2raw.fifo # reject this active candidate
 ```
 
-The `223.5.5.5` / `223.6.6.6` queries and the tunnel both leave through `eth0`, and the
-client installs a `/32` route for each resolved relay address over `eth0` — so a newly
-resolved address works even though the box keeps no `/32` escape route for it in advance
-(a direct-routing policy table's default via the LAN gateway still applies, but the
-explicit `/32` guarantees it regardless of what the default route is doing).
+`promote <candidate-ip>` succeeds only when all of the following are true:
 
-**Rotation workflow (zero-touch cutover):**
+* that exact address is the active, authenticated probationary candidate; when a safe
+  automatic rollback deadline was scheduled, promotion is still before that deadline and
+  the previous committed endpoint remains eligible;
+* at least three accepted inbound authenticated DATA packets for a live local conversation
+  were delivered from that candidate; handshakes, heartbeats and unknown conversations do
+  not count;
+* the first-to-last counted DATA span is at least
+  `--last-good-fallback-probation`;
+* no gap in the counted run, and no age of the most recent evidence at promotion time, is
+  greater than `min(probation, 5 seconds)`; a larger gap resets the evidence run; and
+* persisting the new committed cache succeeds.
 
-1. Prepare the new relay first: bring up the new EIP / listener / firewall and confirm it
-   serves the same key and mode.
-2. Update the DNS `A` record to the new address.
-3. Keep the **old** EIP running through the TTL grace period (30–60 s) so in-flight sessions
-   are not cut.
-4. Either force the cutover now with `echo reconnect > <fifo>` (re-resolves immediately), or
-   wait for the client's own failure detection when you retire the old EIP. The switch is
-   in-process; WireGuard above it never notices beyond a brief reconnect.
-5. Retire the old EIP once the client has moved (its log shows `relay is now <new> …` and
-   `<new> is now last-known-good`).
+Only then is the candidate committed and the previous route/rule released. If stale startup
+history could not support a safe automatic rollback deadline, the old cache/route stay
+preserved and explicit promotion is still allowed after the full DATA evidence; no automatic
+destructive rollback is scheduled in that case. `rollback <candidate-ip>` is accepted only
+for that active probationary address while its preserved committed endpoint is still
+eligible.
 
-**Rollback / break-glass:** point the DNS record back to the previous address and
-`echo reconnect > <fifo>`. If DNS itself is the problem, start the client with a literal
-`-r <ip>:<port>` (no `--dns-server`) — identical to classic udp2raw, no resolution at all —
-or rely on the cached last-known-good address and `--bootstrap-addr` which keep the service
-usable through a startup-time DNS outage.
+#### Bounded DNS influence
+
+Each resolver's answer is validated *before* that resolver is considered successful. An
+answer containing only forbidden/unusable addresses does not suppress the next configured
+resolver. Valid addresses are deduplicated, sorted numerically and capped at eight; DNS wire
+order therefore cannot enlarge or reorder a candidate round. Continuity keeps the current
+or already committed address first when it is still in the set, with remaining choices in
+numeric order.
+
+One resolver pass is capped at 10 seconds total across every configured resolver and any
+UDP-to-TCP retry; with fallback enabled it is further capped by the configured preferred
+round timeout. The preferred round has its own overall deadline, so eight answers or a
+churning/poisoned set cannot multiply per-address handshakes into minutes of delayed
+recovery. TTLs are clamped to 10–3600 seconds, and failed queries back off without erasing
+the current endpoint or last usable candidates.
+
+#### Durable cache and retry limits
+
+The endpoint-cache text format remains backward compatible. Canonical files contain
+`host=`, `port=`, `addr=` and `saved=` (plus the existing optional comment). Legacy files
+without `saved=` remain valid as startup-only history, but cannot override usable DNS until
+that address authenticates in this process. Host and port must exactly match the configured
+endpoint, and the address must be canonical and pass the same safety policy as DNS.
+
+Cache input is limited to 4 KiB and must be one strict document with no trailing fields or
+data. The cache, fallback sidecar and lock must be regular files owned by the effective uid,
+mode exactly `0600`, with one link: symlinks, hard links, FIFOs and devices are rejected.
+Their containing directory is created if needed, then must be a real, effective-uid-owned
+directory with no group/world write bits; a symlinked or replaced directory is rejected.
+
+The FIFO is also an authority, not an ordinary world-writable pipe. A new command FIFO is
+created with exact mode `0600`; a pre-existing one is accepted only when it is a real FIFO
+owned by the effective uid, mode `0600`, with one link. It is opened relative to the held
+trusted parent with `O_NOFOLLOW`; symlinks, regular files, devices, unsafe parents and raced
+replacements fail startup. Put it in an effective-uid-owned non-writable directory such as a
+dedicated directory below `/run`, not directly in a shared writable directory.
+
+Writes use an unpredictable 128-bit-CSPRNG same-directory temporary opened create-new /
+exclusive with `O_NOFOLLOW` and mode `0600`. Metadata is revalidated, contents are written
+fully, the file is `fsync`ed, rename is atomic, and the directory is `fsync`ed. Existing
+unsafe destinations are rejected rather than replaced or followed.
+
+With fallback enabled, `<cache>.fallback-state` is a strict, owner-only v1 sidecar (maximum
+16 KiB) protected by `<cache>.fallback-state.lock`. Each blind old-IP attempt is reloaded and
+**pre-charged under the durable lock before the network probe begins**, so a crash cannot
+refund it and concurrent processes cannot lose an update. A per-set entry is keyed by
+hostname, port, canonical DNS-answer set and candidate address; the global token bucket and
+refill timestamp span every answer set. At most 16 charged set entries are retained; a 17th
+key is refused rather than evicting history. DNS-set churn can therefore neither reset the
+global bucket nor create unbounded state. Unsafe, corrupt or unwritable sidecar/lock state
+disables unattended old-address probes fail-closed, while an already-authorized rollback or
+the endpoint-qualified direct return from an attended cutover remains available.
+
+Runtime-health timestamps are intentionally process-local; after a restart, only the strict
+cache `saved=` timestamp can establish startup freshness until the endpoint authenticates
+again. V1 performs no automatic sidecar migration: for example, lowering global capacity
+below a persisted token count makes that state invalid and disables blind probes until an
+operator performs a reviewed, attended state migration. It is never silently reset, because
+resetting would refund attempts.
+
+#### Route/rule ownership and timing validation
+
+Protocol-235 `/32` routes and iptables rules have independent desired state and independent
+five-second repair retries. An existing rule, or inability to list it, is not evidence that
+the route exists. Cleanup bookkeeping remains until each deletion is confirmed. Routes use
+create-exclusive, per-process metrics and exact-match deletion, so two clients can share one
+relay `/32` without one deleting the other's route; operator routes are not owned or removed.
+
+Fallback configuration is rejected unless:
+
+```text
+rollback_window > connection-loss detection (10 s)
+                + preferred_round_timeout
+                + one handshake timeout (5 s)
+                + probation
+                + two 400 ms timer intervals
+```
+
+The defaults require more than 75.8 seconds and provide 300 seconds. This validation and the
+per-cutover runtime-freshness check prevent a destructive candidate attempt from being
+scheduled after the rollback point would already be ineligible; they supplement, rather
+than replace, activity-based health.
+
+Failure-state summary:
+
+| state / input | smallest-safe v1 result | durable/resource effect |
+|---|---|---|
+| Healthy Ready endpoint; TTL expires or DNS changes | Keep carrying traffic; do not query or cut over merely for TTL/convergence | No cache, budget, route or rule change |
+| Attended `reconnect`; fresh answer has a different address | Interrupt once and try the deterministic preferred candidate only if rollback remains safe | Preserve committed cache and both endpoint resources during the attempt |
+| Attended candidate is down or has the wrong key | Return directly to the just-working committed endpoint | No blind-probe token charged; candidate never enters cache |
+| New relay handshakes but black-holes DATA | Keep it probationary; reject promotion without sustained accepted DATA; collector/operator rolls it back | Previous cache and native route/rule remain intact |
+| Startup/automatic probation needs to return to old | Return only after a locked durable pre-charge; if denied, do not tear down a live candidate | Consume per-set/cooldown and global limits like every blind old-IP probe |
+| Candidate meets DATA evidence and receives matching `promote` | Persist candidate, then make it committed-good | Release previous route/rule only after durable cache success |
+| Preferred candidates fail without an attendant | After the configured threshold and a bounded candidate turn/deadline, try eligible committed-good only after locked durable pre-charge | Consume both its per-set charge/cooldown and one global token before probing |
+| Resolver one returns only unsafe addresses | Treat that resolver as failed and query resolver two within the shared deadline | Last usable set and committed state remain unchanged |
+| Resolver timeout, NXDOMAIN, malformed reply or overall deadline | Keep current/last usable state; retry with backoff | Does not refund/reset persisted budgets |
+| Process crashes or restarts with unchanged/churning DNS | Reload the locked sidecar; an in-flight attempt was already charged | Per-set cooldown/cap and global bucket survive restart and set churn |
+| Cache/sidecar is oversized, malformed, wrong identity/mode/owner/type or unsafe | Reject it; DNS then safe `--bootstrap-addr` decide startup. Unsafe budget state disables blind fallback | Never follow a symlink/FIFO/device; fail closed |
+| Route or rule creation/deletion fails | Retry the two resources independently; keep failed cleanup pending | Never infer one resource from the other or delete a peer client's exact route |
+| Preferred round deadline expires | Stop extending that round with more candidate handshakes | Preserve the rollback point and begin only a later bounded reconnect round |
+
+**DNS record recommendation:** publish exactly one unproxied IPv4 `A` record with a 30–60
+second TTL. Multiple answers are bounded safely, but one record makes an attended migration
+and its rollback unambiguous.
+
+Example (AliDNS, native `eth0`, opt-in fallback and attended FIFO authority):
+
+```sh
+sudo ./udp2raw -c -l 127.0.0.1:7000 -r relay.example.com:8443 \
+    -k "passwd" --raw-mode faketcp -a --fix-gro \
+    --dns-server 223.5.5.5:53 --dns-server 223.6.6.6:53 \
+    --underlay-dev eth0 --fifo /run/udp2raw.fifo \
+    --endpoint-cache /var/lib/udp2raw/endpoint_relay.example.com_8443 \
+    --last-good-fallback
+```
+
+Attended rotation workflow:
+
+1. Prepare the new relay and independently verify its key, mode, listener, firewall and real
+   gateway traffic path. Keep the old relay running.
+2. Change DNS, then request one cutover with `echo reconnect > /run/udp2raw.fifo`.
+3. While the new address is probationary, let the external health collector measure the real
+   service path. Send `promote <new-ip>` only after it is healthy; send `rollback <new-ip>`
+   immediately if it black-holes or degrades traffic.
+4. Retire the old relay only after the promotion log confirms the new committed-good address
+   and release of the previous endpoint.
+
+Automatic migration from a healthy fallback is deliberately deferred. A future version may
+add an independent parallel canary socket/session with measured packet-loss bounds and true
+make-before-break behavior; v1 never performs recurring destructive convergence probes.
+For break-glass startup when DNS itself is unavailable, the strict cache and safe
+`--bootstrap-addr` remain available, or use a literal `-r <ip>:<port>` to retain classic
+no-resolution behavior.
 
 ## Performance
 
