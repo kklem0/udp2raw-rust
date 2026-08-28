@@ -972,6 +972,20 @@ impl Client {
             self.info.last_hb_sent_time = 0;
             // fall through
         }
+        if matches!(
+            self.state,
+            State::TcpHandshake
+                | State::TcpHandshakeDummy
+                | State::Handshake1
+                | State::Handshake2
+        ) && self.endpoint.preferred_round_expired(now)
+        {
+            self.go_idle(
+                CycleReason::AttemptFailed,
+                " because the preferred-candidate round deadline expired",
+            );
+            return;
+        }
         match self.state {
             State::Idle => {}
             State::TcpHandshake => {

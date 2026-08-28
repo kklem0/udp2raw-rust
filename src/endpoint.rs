@@ -756,6 +756,13 @@ impl EndpointController {
         self.current_authenticated
     }
 
+    /// Whether the absolute preferred-candidate round deadline has elapsed. The client uses
+    /// this while a handshake is in flight so the deadline bounds the whole round, not only
+    /// the decision to start another candidate.
+    pub fn preferred_round_expired(&self, now_ms: u64) -> bool {
+        self.round_expired(now_ms)
+    }
+
     fn persist_committed(&self, cur: Ipv4Addr, changed: bool) {
         if let (Some(p), Some(name)) = (self.opts.cache_file.as_deref(), self.spec.hostname()) {
             match save_cache_with_policy(p, name, self.spec.port(), cur, self.opts.allow_private) {
