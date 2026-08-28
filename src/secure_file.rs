@@ -15,9 +15,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::ffi::CString;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -80,6 +82,33 @@ fn validate_directory_metadata(path: &Path, metadata: &fs::Metadata) -> io::Resu
                 "containing directory mode {:04o} permits group/world writes",
                 metadata.mode() & 0o7777
             ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_fifo_metadata(path: &Path, metadata: &fs::Metadata, require_mode: bool) -> io::Result<()> {
+    if !metadata.file_type().is_fifo() {
+        return Err(invalid(path, "not a FIFO"));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(invalid(
+            path,
+            format!("FIFO owner uid {} is not effective uid {euid}", metadata.uid()),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(invalid(
+            path,
+            format!("FIFO link count {} is not 1", metadata.nlink()),
+        ));
+    }
+    if require_mode && metadata.mode() & 0o7777 != OWNER_ONLY_MODE {
+        return Err(invalid(
+            path,
+            format!("FIFO mode {:04o} is not 0600", metadata.mode() & 0o7777),
         ));
     }
     Ok(())
@@ -394,6 +423,95 @@ pub fn atomic_write_owner_only(_path: &Path, _contents: &[u8]) -> io::Result<()>
     Err(unsupported())
 }
 
+/// Create or open an owner-only command FIFO without following filesystem links.
+///
+/// A new FIFO is created relative to a held trusted-directory descriptor with mode 0600.
+/// A pre-existing FIFO is accepted only when it is owned by the effective uid, has exact
+/// mode 0600 and one link, and its directory entry still names the opened inode. Symlinks,
+/// regular files, devices, unsafe parents, and raced replacements are rejected.
+#[cfg(unix)]
+pub fn open_owner_only_fifo(path: &Path) -> io::Result<File> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no FIFO name", path.display()),
+        )
+    })?;
+    let name = CString::new(file_name.as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "FIFO path contains a NUL byte"))?;
+    let (directory, child) = TrustedDirectory::for_path(path, true)?;
+
+    let created = if unsafe {
+        libc::mkfifoat(
+            directory.file.as_raw_fd(),
+            name.as_ptr(),
+            OWNER_ONLY_MODE as libc::mode_t,
+        )
+    } == 0
+    {
+        true
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            false
+        } else {
+            return Err(error);
+        }
+    };
+
+    let result = (|| {
+        let initial = fs::symlink_metadata(&child)?;
+        validate_fifo_metadata(&child, &initial, !created)?;
+        directory.revalidate()?;
+
+        let fd = unsafe {
+            libc::openat(
+                directory.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        validate_fifo_metadata(&child, &file.metadata()?, false)?;
+        if created {
+            set_exact_mode(&file)?;
+        }
+        let opened = file.metadata()?;
+        validate_fifo_metadata(&child, &opened, true)?;
+        directory.revalidate()?;
+        let current = fs::symlink_metadata(&child)?;
+        validate_fifo_metadata(&child, &current, true)?;
+        if opened.dev() != current.dev() || opened.ino() != current.ino() {
+            return Err(invalid(
+                &child,
+                "directory entry is not the FIFO held by the open descriptor",
+            ));
+        }
+        if created {
+            directory.sync()?;
+        }
+        Ok(file)
+    })();
+
+    if result.is_err() && created {
+        // The containing directory is trusted and held. Remove only the entry we created;
+        // this avoids publishing a partially validated command authority.
+        unsafe {
+            libc::unlinkat(directory.file.as_raw_fd(), name.as_ptr(), 0);
+        }
+        let _ = directory.sync();
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub fn open_owner_only_fifo(_path: &Path) -> io::Result<File> {
+    Err(unsupported())
+}
+
 #[cfg(all(unix, test))]
 fn canonical_lock_path(path: &Path) -> io::Result<PathBuf> {
     TrustedDirectory::for_path(path, true).map(|(_, child)| child)
@@ -686,6 +804,7 @@ mod tests {
     fn assert_parent_rejected_by_all_operations(path: &Path) {
         assert!(read_owner_only(path, 1024).is_err());
         assert!(atomic_write_owner_only(path, b"must not write").is_err());
+        assert!(open_owner_only_fifo(path).is_err());
         assert!(
             with_owner_only_lock(path, || -> io::Result<()> {
                 panic!("lock closure ran for an untrusted parent")
@@ -897,6 +1016,39 @@ mod tests {
         assert!(read_owner_only(&fifo, 1024).is_err());
 
         assert!(read_owner_only(Path::new("/dev/null"), 1024).is_err());
+    }
+
+    #[test]
+    fn command_fifo_is_owner_only_and_never_follows_malicious_entries() {
+        let dir = TestDir::new("command-fifo");
+        let fifo = dir.0.join("commands");
+        let file = open_owner_only_fifo(&fifo).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o7777, OWNER_ONLY_MODE);
+        assert_eq!(metadata.nlink(), 1);
+        drop(file);
+
+        let writable = dir.0.join("writable");
+        let writable_c = std::ffi::CString::new(writable.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(writable_c.as_ptr(), 0o600) }, 0);
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(open_owner_only_fifo(&writable).is_err());
+
+        let linked = dir.0.join("linked");
+        let linked_c = std::ffi::CString::new(linked.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(linked_c.as_ptr(), 0o600) }, 0);
+        fs::hard_link(&linked, dir.0.join("linked-alias")).unwrap();
+        assert!(open_owner_only_fifo(&linked).is_err());
+
+        let target = dir.0.join("target");
+        write_plain_0600(&target, b"must stay unchanged");
+        let malicious = dir.0.join("malicious");
+        symlink(&target, &malicious).unwrap();
+        assert!(open_owner_only_fifo(&malicious).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"must stay unchanged");
+        assert!(fs::symlink_metadata(&malicious).unwrap().file_type().is_symlink());
     }
 
     #[test]
