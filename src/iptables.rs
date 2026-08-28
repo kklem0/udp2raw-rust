@@ -90,6 +90,18 @@ pub fn pattern_for(cfg: &Config, remote: SocketAddr) -> String {
     }
 }
 
+fn listing_has_jump(output: &str, chain: &str, pattern: &str) -> bool {
+    let identity = pattern.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    output.lines().any(|line| {
+        // iptables-save canonicalizes host matches as /32 or /128, while the command
+        // pattern uses a plain address. Match the private target plus the generated rule's
+        // leading identity, allowing iptables to insert an explicit match module on output.
+        let normalized = line.replace("/32", "").replace("/128", "");
+        normalized.ends_with(&format!("-j {chain}"))
+            && normalized.contains(&format!(" {identity} "))
+    })
+}
+
 /// `--clear`: remove every rule and chain this program ever added.
 pub fn clear_all(cfg: &Config) {
     let cmd = base_command(cfg);
@@ -141,16 +153,29 @@ impl Iptables {
         let cmd = base_command(cfg);
         let chains = [format!("udp2rawDwrW_{const_id:x}_C0"), format!("udp2rawDwrW_{const_id:x}_C1")];
         let it = Iptables { cmd, chains, keep, keep_index: AtomicUsize::new(0), patterns: Mutex::new(Vec::new()) };
+        // Record the desired jump before construction so a partial initialization can use
+        // `clear` to roll back every step that did succeed.
+        it.patterns.lock().unwrap().push(pattern.to_string());
         for i in 0..=(keep as usize) {
-            run_command(&format!("{}-N {}", it.cmd, it.chains[i]), true);
-            run_command(&format!("{}-F {}", it.cmd, it.chains[i]), true);
-            run_command(&format!("{}-I {} -j DROP", it.cmd, it.chains[i]), true);
+            // `-N` may legitimately fail when recovering a chain left by an interrupted
+            // initialization. Flushing it is the authoritative existence/permission check.
+            run_command(&format!("{}-N {}", it.cmd, it.chains[i]), false);
+            let flush = format!("{}-F {}", it.cmd, it.chains[i]);
+            if !run_command(&flush, true).0 {
+                it.clear();
+                return Err(io::Error::other(format!("auto added iptables failed by: {flush}")));
+            }
+            let drop = format!("{}-I {} -j DROP", it.cmd, it.chains[i]);
+            if !run_command(&drop, true).0 {
+                it.clear();
+                return Err(io::Error::other(format!("auto added iptables failed by: {drop}")));
+            }
             let add = it.jump_add(i, pattern);
             if !run_command(&add, true).0 {
+                it.clear();
                 return Err(io::Error::other(format!("auto added iptables failed by: {add}")));
             }
         }
-        it.patterns.lock().unwrap().push(pattern.to_string());
         log::warn!("auto added iptables rules");
         Ok(it)
     }
@@ -183,13 +208,13 @@ impl Iptables {
         Ok(())
     }
 
-    /// Remove the INPUT jumps of one match pattern (from both chains, however many times
-    /// they were added). Unknown patterns are ignored.
-    pub fn del_pattern(&self, pattern: &str) {
+    /// Remove the INPUT jumps of one match pattern (from every managed chain, however many
+    /// times they were added). Bookkeeping is retained until `iptables -S` verifies that the
+    /// jump is absent, allowing a transient deletion failure to be retried later.
+    pub fn del_pattern(&self, pattern: &str) -> io::Result<()> {
         let mut pats = self.patterns.lock().unwrap();
-        let Some(pos) = pats.iter().position(|p| p == pattern) else { return };
-        pats.remove(pos);
-        for i in 0..2 {
+        let Some(pos) = pats.iter().position(|p| p == pattern) else { return Ok(()) };
+        for i in 0..=(self.keep as usize) {
             let del = self.jump_del(i, pattern);
             for _ in 0..4 {
                 if !run_command(&del, false).0 {
@@ -197,7 +222,23 @@ impl Iptables {
                 }
             }
         }
+        let list = format!("{}-S INPUT", self.cmd);
+        let (ok, output) = run_command(&list, false);
+        if !ok {
+            return Err(io::Error::other(format!("iptables could not verify rule cleanup: {list}")));
+        }
+        for i in 0..=(self.keep as usize) {
+            let expected = format!("-A INPUT {pattern} -j {}", self.chains[i]);
+            let still_present = listing_has_jump(&output, &self.chains[i], pattern);
+            if still_present {
+                return Err(io::Error::other(format!(
+                    "iptables rule cleanup is still pending: {expected}"
+                )));
+            }
+        }
+        pats.remove(pos);
         log::info!("iptables: removed rule [{pattern}]");
+        Ok(())
     }
 
     pub fn patterns(&self) -> Vec<String> {
@@ -276,5 +317,15 @@ mod tests {
         assert_eq!(pattern(&u), "-s 47.243.1.1 -p udp -m udp --sport 8443");
         let s = cfg("-s -l 0.0.0.0:8443 -r 127.0.0.1:51820");
         assert_eq!(pattern(&s), "-p tcp -m tcp --dport 8443");
+    }
+
+    #[test]
+    fn cleanup_listing_match_tolerates_iptables_normalization() {
+        let chain = "udp2rawDwrW_123_C0";
+        let pattern = "-s 47.243.1.1 -p icmp --icmp-type 0";
+        let listing = "-A INPUT -s 47.243.1.1/32 -p icmp -m icmp --icmp-type 0 -j udp2rawDwrW_123_C0\n";
+        assert!(listing_has_jump(listing, chain, pattern));
+        assert!(!listing_has_jump(listing, chain, "-s 47.243.1.2 -p icmp --icmp-type 0"));
+        assert!(!listing_has_jump(listing, "udp2rawDwrW_456_C0", pattern));
     }
 }

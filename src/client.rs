@@ -7,7 +7,7 @@ use crate::consts::*;
 use crate::conv::ConvManager;
 use crate::crypto::Crypto;
 use crate::faketcp::{RawCtx, RecvMeta};
-use crate::endpoint::{CycleReason, EndpointController, Switch};
+use crate::endpoint::{CycleReason, EndpointController, PromotionResult, Switch};
 use crate::fifo;
 use crate::iptables::{self, Iptables};
 use crate::net::route;
@@ -19,7 +19,7 @@ use crate::wire;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use std::io;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -42,6 +42,7 @@ enum State {
 
 /// The native interface for relay traffic (`--underlay-dev`) and what a host route through
 /// it needs.
+#[derive(Clone)]
 struct Underlay {
     dev: String,
     ifindex: u32,
@@ -84,11 +85,252 @@ impl Underlay {
     }
 }
 
+#[cfg(test)]
+mod endpoint_resource_tests {
+    use super::{EndpointResources, ManagedState};
+
+    #[test]
+    fn every_route_rule_add_failure_combination_retries_independently() {
+        for route_first_ok in [false, true] {
+            for rule_first_ok in [false, true] {
+                let mut state = EndpointResources::new(true, true);
+                let mut route_calls = 0;
+                let mut rule_calls = 0;
+                state.attempt_adds(
+                    || {
+                        route_calls += 1;
+                        route_first_ok
+                    },
+                    || {
+                        rule_calls += 1;
+                        rule_first_ok
+                    },
+                );
+                assert_eq!(
+                    state.route,
+                    if route_first_ok { ManagedState::Present } else { ManagedState::Missing }
+                );
+                assert_eq!(
+                    state.rule,
+                    if rule_first_ok { ManagedState::Present } else { ManagedState::Missing }
+                );
+
+                state.attempt_adds(
+                    || {
+                        route_calls += 1;
+                        true
+                    },
+                    || {
+                        rule_calls += 1;
+                        true
+                    },
+                );
+                assert_eq!(state.route, ManagedState::Present);
+                assert_eq!(state.rule, ManagedState::Present);
+                assert_eq!(route_calls, if route_first_ok { 1 } else { 2 });
+                assert_eq!(rule_calls, if rule_first_ok { 1 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn route_retries_when_auto_rule_is_not_managed() {
+        let mut state = EndpointResources::new(true, false);
+        let mut route_calls = 0;
+        let mut impossible_rule_calls = 0;
+        state.attempt_adds(
+            || {
+                route_calls += 1;
+                false
+            },
+            || {
+                impossible_rule_calls += 1;
+                true
+            },
+        );
+        state.attempt_adds(
+            || {
+                route_calls += 1;
+                true
+            },
+            || {
+                impossible_rule_calls += 1;
+                true
+            },
+        );
+        assert_eq!(state.route, ManagedState::Present);
+        assert_eq!(state.rule, ManagedState::NotNeeded);
+        assert_eq!(route_calls, 2);
+        assert_eq!(impossible_rule_calls, 0);
+    }
+
+    #[test]
+    fn every_cleanup_failure_combination_is_retained_and_retried() {
+        for route_first_ok in [false, true] {
+            for rule_first_ok in [false, true] {
+                let mut state = EndpointResources::new(true, true);
+                state.attempt_adds(|| true, || true);
+                state.begin_release();
+                let mut route_calls = 0;
+                let mut rule_calls = 0;
+                state.attempt_cleanup(
+                    || {
+                        route_calls += 1;
+                        route_first_ok
+                    },
+                    || {
+                        rule_calls += 1;
+                        rule_first_ok
+                    },
+                );
+                assert_eq!(state.cleanup_complete(), route_first_ok && rule_first_ok);
+
+                state.attempt_cleanup(
+                    || {
+                        route_calls += 1;
+                        true
+                    },
+                    || {
+                        rule_calls += 1;
+                        true
+                    },
+                );
+                assert!(state.cleanup_complete());
+                assert_eq!(route_calls, if route_first_ok { 1 } else { 2 });
+                assert_eq!(rule_calls, if rule_first_ok { 1 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn pending_cleanup_can_be_cancelled_and_missing_piece_reinstalled() {
+        let mut state = EndpointResources::new(true, true);
+        state.attempt_adds(|| true, || true);
+        state.begin_release();
+        state.attempt_cleanup(|| true, || false);
+        assert_eq!(state.route, ManagedState::Missing);
+        assert_eq!(state.rule, ManagedState::Removing);
+
+        state.cancel_release();
+        let mut route_adds = 0;
+        let mut rule_adds = 0;
+        state.attempt_adds(
+            || {
+                route_adds += 1;
+                true
+            },
+            || {
+                rule_adds += 1;
+                true
+            },
+        );
+        assert_eq!(state.route, ManagedState::Present);
+        assert_eq!(state.rule, ManagedState::Present);
+        assert_eq!(route_adds, 1);
+        assert_eq!(rule_adds, 0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedState {
+    /// This client configuration does not manage this kind of resource.
+    NotNeeded,
+    /// The resource is required but is not installed yet (or was successfully deleted).
+    Missing,
+    Present,
+    /// Deletion was requested but has not yet been confirmed.
+    Removing,
+}
+
+/// Pure route/rule state. The callbacks deliberately run independently: failure of one
+/// resource must not suppress an attempt or retry of the other one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndpointResources {
+    route: ManagedState,
+    rule: ManagedState,
+    releasing: bool,
+}
+
+impl EndpointResources {
+    fn new(route_needed: bool, rule_needed: bool) -> EndpointResources {
+        EndpointResources {
+            route: if route_needed { ManagedState::Missing } else { ManagedState::NotNeeded },
+            rule: if rule_needed { ManagedState::Missing } else { ManagedState::NotNeeded },
+            releasing: false,
+        }
+    }
+
+    fn mark_initial_rule_present(&mut self) {
+        if self.rule != ManagedState::NotNeeded {
+            self.rule = ManagedState::Present;
+        }
+    }
+
+    fn attempt_adds<R, I>(&mut self, mut add_route: R, mut add_rule: I)
+    where
+        R: FnMut() -> bool,
+        I: FnMut() -> bool,
+    {
+        if self.releasing {
+            return;
+        }
+        if self.route == ManagedState::Missing && add_route() {
+            self.route = ManagedState::Present;
+        }
+        if self.rule == ManagedState::Missing && add_rule() {
+            self.rule = ManagedState::Present;
+        }
+    }
+
+    fn begin_release(&mut self) {
+        self.releasing = true;
+        if self.route == ManagedState::Present {
+            self.route = ManagedState::Removing;
+        }
+        if self.rule == ManagedState::Present {
+            self.rule = ManagedState::Removing;
+        }
+    }
+
+    fn cancel_release(&mut self) {
+        self.releasing = false;
+        if self.route == ManagedState::Removing {
+            self.route = ManagedState::Present;
+        }
+        if self.rule == ManagedState::Removing {
+            self.rule = ManagedState::Present;
+        }
+    }
+
+    fn attempt_cleanup<R, I>(&mut self, mut delete_route: R, mut delete_rule: I)
+    where
+        R: FnMut() -> bool,
+        I: FnMut() -> bool,
+    {
+        if !self.releasing {
+            return;
+        }
+        if self.route == ManagedState::Removing && delete_route() {
+            self.route = ManagedState::Missing;
+        }
+        if self.rule == ManagedState::Removing && delete_rule() {
+            self.rule = ManagedState::Missing;
+        }
+    }
+
+    fn cleanup_complete(&self) -> bool {
+        self.releasing
+            && matches!(self.route, ManagedState::Missing | ManagedState::NotNeeded)
+            && matches!(self.rule, ManagedState::Missing | ManagedState::NotNeeded)
+    }
+}
+
 /// Kernel state this process installed for one relay address.
 struct Installed {
     addr: SocketAddr,
-    route: bool,
-    rule: Option<String>,
+    route_metric: u32,
+    rule_pattern: Option<String>,
+    resources: EndpointResources,
 }
 
 struct Client {
@@ -118,6 +360,8 @@ struct Client {
     ipt: Option<Arc<Iptables>>,
     underlay: Option<Underlay>,
     installed: Vec<Installed>,
+    /// Last periodic retry of incomplete route/rule installation or cleanup.
+    last_kernel_retry_ms: u64,
     /// Why the next attempt from `Idle` starts (set wherever `go_idle` is called).
     cycle_reason: CycleReason,
     exit_flag: &'static AtomicBool,
@@ -131,6 +375,13 @@ struct Client {
 const DRAIN_BUDGET: usize = 64;
 /// Datagrams per `recvmmsg`.
 const RX_BATCH: usize = 32;
+/// A random owner metric collision is extraordinarily unlikely; keep recovery bounded if
+/// the metric space is deliberately occupied.
+const ROUTE_METRIC_COLLISION_PROBES: usize = 16;
+/// Cleanup is normally one local netlink/iptables round. Give transient failures a few more
+/// synchronous turns before process exit, in addition to timer retries while running.
+const FINAL_CLEANUP_RETRIES: usize = 3;
+const KERNEL_RESOURCE_RETRY_MS: u64 = 5_000;
 
 pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static AtomicBool, endpoint: EndpointController, ipt: Option<Arc<Iptables>>) -> io::Result<()> {
     let remote = endpoint.current();
@@ -208,6 +459,7 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
         ipt,
         underlay,
         installed: Vec::new(),
+        last_kernel_retry_ms: 0,
         cycle_reason: CycleReason::Startup,
         exit_flag,
         udp_pending: false,
@@ -216,6 +468,16 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
     c.record_initial_endpoint();
     let r = c.event_loop();
     c.release_all();
+    for _ in 0..FINAL_CLEANUP_RETRIES {
+        if !c.has_pending_cleanup() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        c.retry_cleanup();
+    }
+    if c.has_pending_cleanup() {
+        log::warn!("kernel endpoint cleanup remains pending after final retries");
+    }
     r
 }
 
@@ -320,6 +582,7 @@ impl Client {
     }
 
     fn go_idle(&mut self, reason: CycleReason, why: &str) {
+        self.endpoint.on_session_ended();
         self.cycle_reason = reason;
         self.state = State::Idle;
         self.info.my_id = secure_random_u32_nz();
@@ -562,16 +825,18 @@ impl Client {
 
     /// `plain[off..]` is the packet payload; the buffer is recycled or queued for sending.
     fn on_safer_packet(&mut self, ptype: u8, plain: Vec<u8>, off: usize) {
+        let activity_now = now_ms();
         if self.state == State::Handshake2 {
             log::info!("changed state from to client_handshake2 to client_ready");
             self.state = State::Ready;
             self.info.last_hb_sent_time = 0;
             self.on_endpoint_authenticated();
-            self.info.last_hb_recv_time = now_ms();
+            self.info.last_hb_recv_time = activity_now;
             self.info.last_oppsite_roller_time = self.info.last_hb_recv_time;
             self.on_timer();
         }
         if ptype == TYPE_HEARTBEAT {
+            self.endpoint.on_authenticated_activity(activity_now, false);
             log::debug!("[hb]heart beat received,oppsite_roller={}", self.info.oppsite_roller);
             self.info.last_hb_recv_time = now_ms();
             self.pool.recycle(plain);
@@ -592,6 +857,11 @@ impl Client {
                 self.pool.recycle(plain);
                 return;
             }
+            // Promotion evidence is deliberately stricter than authentication: only
+            // correctly framed DATA for a live conversation that will be delivered to the
+            // local transport counts. A keyed relay that merely handshakes or emits
+            // heartbeats therefore cannot erase the rollback point.
+            self.endpoint.on_authenticated_activity(activity_now, true);
             self.convs.update_active_time(conv, now_ms());
             let peer = *self.convs.find_data_by_conv(conv).unwrap();
             self.udp_tx.push(TxPacket { buf: plain, off: off + 4, dst: TxDst::Sock(peer) });
@@ -607,6 +877,12 @@ impl Client {
 
     fn on_timer(&mut self) {
         let now = now_ms();
+        if now.saturating_sub(self.last_kernel_retry_ms) >= KERNEL_RESOURCE_RETRY_MS {
+            self.last_kernel_retry_ms = now;
+            let current = self.remote;
+            self.ensure_installed(current);
+            self.retry_cleanup();
+        }
         for (conv, _) in self.convs.clear_inactive(now) {
             log::info!("conv {conv:x} cleared");
         }
@@ -783,6 +1059,10 @@ impl Client {
             }
             State::Ready => {
                 self.fail_time_counter = 0;
+                if self.endpoint.probation_rollback_due(now) {
+                    self.go_idle(CycleReason::ProbationExpired, " (probation rollback window expired)");
+                    return;
+                }
                 if now - self.info.last_hb_recv_time > CLIENT_CONN_TIMEOUT_MS {
                     self.go_idle(CycleReason::SessionLost, " from  client_ready bc of server-->client direction timeout");
                     return;
@@ -815,77 +1095,156 @@ impl Client {
     /// its host route (with `--underlay-dev`) is installed here.
     fn record_initial_endpoint(&mut self) {
         let addr = self.remote;
-        let rule = self.ipt.as_ref().map(|_| self.pattern_for(addr));
-        let route = self.install_route(addr);
-        self.installed.push(Installed { addr, route, rule });
+        let rule_pattern = self.ipt.as_ref().map(|_| self.pattern_for(addr));
+        let route_needed = self.underlay.is_some() && matches!(addr.ip(), IpAddr::V4(_));
+        let mut resources = EndpointResources::new(route_needed, rule_pattern.is_some());
+        resources.mark_initial_rule_present();
+        self.installed.push(Installed {
+            addr,
+            route_metric: route::owned_metric(self.const_id),
+            rule_pattern,
+            resources,
+        });
+        self.ensure_installed(addr);
     }
 
-    fn install_route(&self, addr: SocketAddr) -> bool {
-        let (Some(u), IpAddr::V4(v4)) = (&self.underlay, addr.ip()) else { return false };
-        match route::replace_host_route(v4, u.gateway, u.ifindex, u.prefsrc) {
-            Ok(()) => {
-                log::info!("route: {v4}/32 {}dev {} metric {} proto {}", u.gateway.map_or(String::new(), |g| format!("via {g} ")), u.dev, route::ROUTE_METRIC, route::RTPROT_UDP2RAW);
-                true
-            }
-            Err(e) => {
-                log::warn!("route: could not install {v4}/32 {}dev {}: {e}", u.gateway.map_or(String::new(), |g| format!("via {g} ")), u.dev);
-                false
-            }
-        }
-    }
-
-    /// Rule and route for `addr`, installed before the first packet goes there.
-    /// Rule and route for `addr`, installed before the first packet goes there. Idempotent
-    /// and self-healing: if a previous `add_pattern` failed (iptables was busy) the entry is
-    /// kept with `rule = None` and the rule is retried on the next call, so the DROP rule for
-    /// the address in use is (re)established every reconnect cycle even without a switch.
-    fn ensure_installed(&mut self, addr: SocketAddr) {
-        let pos = self.installed.iter().position(|i| i.addr == addr);
-        if let Some(p) = pos {
-            if self.installed[p].rule.is_some() || self.ipt.is_none() {
-                return; // already fully installed (or no -a: nothing to add)
-            }
-        }
-        let rule = match self.ipt.clone() {
-            Some(ipt) => {
-                let pat = self.pattern_for(addr);
-                match ipt.add_pattern(&pat) {
-                    Ok(()) => Some(pat),
-                    Err(e) => {
-                        log::warn!("{e}");
-                        None
-                    }
+    fn install_owned_route(u: &Underlay, addr: SocketAddr, metric: &mut u32) -> bool {
+        let IpAddr::V4(v4) = addr.ip() else { return false };
+        for _ in 0..ROUTE_METRIC_COLLISION_PROBES {
+            match route::create_host_route(v4, u.gateway, u.ifindex, u.prefsrc, *metric) {
+                Ok(()) => {
+                    log::info!("route: {v4}/32 {}dev {} metric {} proto {}", u.gateway.map_or(String::new(), |g| format!("via {g} ")), u.dev, *metric, route::RTPROT_UDP2RAW);
+                    return true;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    // Another client (or an operator route) owns this exact prefix/metric.
+                    // Never replace it; choose another exact deletion key for this process.
+                    *metric = route::next_owned_metric(*metric);
+                }
+                Err(e) => {
+                    log::warn!("route: could not install {v4}/32 {}dev {} metric {}: {e}", u.gateway.map_or(String::new(), |g| format!("via {g} ")), u.dev, *metric);
+                    return false;
                 }
             }
-            None => None,
-        };
-        match pos {
-            Some(p) => self.installed[p].rule = rule,
-            None => {
-                let route = self.install_route(addr);
-                self.installed.push(Installed { addr, route, rule });
-            }
         }
+        log::warn!("route: could not find a free owned metric for {v4}/32 dev {} after {ROUTE_METRIC_COLLISION_PROBES} attempts", u.dev);
+        false
+    }
+
+    /// Rule and route for `addr`, installed before the first packet goes there. Each resource
+    /// has independent desired/installed state: an existing rule (or no `-a` at all) cannot
+    /// suppress a route retry, and a route success cannot suppress a failed rule retry.
+    fn ensure_installed(&mut self, addr: SocketAddr) {
+        let pos = match self.installed.iter().position(|i| i.addr == addr) {
+            Some(p) => p,
+            None => {
+                let rule_pattern = self.ipt.as_ref().map(|_| self.pattern_for(addr));
+                let route_needed = self.underlay.is_some() && matches!(addr.ip(), IpAddr::V4(_));
+                self.installed.push(Installed {
+                    addr,
+                    route_metric: route::owned_metric(self.const_id),
+                    resources: EndpointResources::new(route_needed, rule_pattern.is_some()),
+                    rule_pattern,
+                });
+                self.installed.len() - 1
+            }
+        };
+
+        self.installed[pos].resources.cancel_release();
+        let underlay = self.underlay.clone();
+        let ipt = self.ipt.clone();
+        let rule_pattern = self.installed[pos].rule_pattern.clone();
+        let mut metric = self.installed[pos].route_metric;
+        self.installed[pos].resources.attempt_adds(
+            || match &underlay {
+                Some(u) => Self::install_owned_route(u, addr, &mut metric),
+                None => false,
+            },
+            || match (&ipt, &rule_pattern) {
+                (Some(ipt), Some(pattern)) => match ipt.add_pattern(pattern) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("{e}");
+                        false
+                    }
+                },
+                _ => false,
+            },
+        );
+        self.installed[pos].route_metric = metric;
     }
 
     fn release(&mut self, addr: SocketAddr) {
         let Some(pos) = self.installed.iter().position(|i| i.addr == addr) else { return };
-        let ent = self.installed.remove(pos);
-        if let (Some(ipt), Some(p)) = (&self.ipt, &ent.rule) {
-            ipt.del_pattern(p);
+        self.installed[pos].resources.begin_release();
+        self.retry_cleanup_addr(addr);
+    }
+
+    fn retry_cleanup_addr(&mut self, addr: SocketAddr) {
+        let Some(pos) = self.installed.iter().position(|i| i.addr == addr) else { return };
+        if !self.installed[pos].resources.releasing {
+            return;
         }
-        if ent.route {
-            if let (Some(u), IpAddr::V4(v4)) = (&self.underlay, addr.ip()) {
-                match route::delete_host_route(v4, u.ifindex) {
-                    Ok(()) => log::info!("route: removed {v4}/32 dev {}", u.dev),
-                    Err(e) => log::warn!("route: could not remove {v4}/32 dev {}: {e}", u.dev),
-                }
-            }
+        let underlay = self.underlay.clone();
+        let ipt = self.ipt.clone();
+        let metric = self.installed[pos].route_metric;
+        let rule_pattern = self.installed[pos].rule_pattern.clone();
+        self.installed[pos].resources.attempt_cleanup(
+            || match (&underlay, addr.ip()) {
+                (Some(u), IpAddr::V4(v4)) => match route::delete_host_route(v4, u.gateway, u.ifindex, metric) {
+                    Ok(()) => {
+                        log::info!("route: removed {v4}/32 dev {} metric {metric}", u.dev);
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!("route: could not remove {v4}/32 dev {} metric {metric}: {e}; cleanup will retry", u.dev);
+                        false
+                    }
+                },
+                _ => false,
+            },
+            || match (&ipt, &rule_pattern) {
+                (Some(ipt), Some(pattern)) => match ipt.del_pattern(pattern) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("{e}; cleanup will retry");
+                        false
+                    }
+                },
+                _ => false,
+            },
+        );
+        if self.installed[pos].resources.cleanup_complete() {
+            self.installed.remove(pos);
         }
+    }
+
+    fn retry_cleanup(&mut self) {
+        let pending: Vec<SocketAddr> = self
+            .installed
+            .iter()
+            .filter(|i| i.resources.releasing)
+            .map(|i| i.addr)
+            .collect();
+        for addr in pending {
+            self.retry_cleanup_addr(addr);
+        }
+    }
+
+    fn has_pending_cleanup(&self) -> bool {
+        self.installed.iter().any(|i| i.resources.releasing)
     }
 
     /// Drop the kernel state of every address not in `keep`.
     fn release_except(&mut self, keep: &[SocketAddr]) {
+        // A stale address can become the rollback/current endpoint again while deletion is
+        // pending. Cancel it and independently restore anything already removed.
+        for addr in keep {
+            if let Some(ent) = self.installed.iter_mut().find(|i| i.addr == *addr) {
+                ent.resources.cancel_release();
+            }
+            self.ensure_installed(*addr);
+        }
         let stale: Vec<SocketAddr> = self.installed.iter().map(|i| i.addr).filter(|a| !keep.contains(a)).collect();
         for a in stale {
             self.release(a);
@@ -927,26 +1286,56 @@ impl Client {
         log::warn!("endpoint: relay is now {} (was {}; {})", sw.to, sw.from, sw.why);
     }
 
-    /// The handshake with the current address succeeded: it becomes last-known-good and the
-    /// kernel state of every other address goes.
+    fn release_non_retained_endpoints(&mut self) {
+        let port = self.remote.port();
+        let keep: Vec<SocketAddr> = self
+            .endpoint
+            .retained_addresses()
+            .into_iter()
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+            .collect();
+        self.release_except(&keep);
+    }
+
+    /// An authenticated candidate can remain probationary. Preserve both its resources and
+    /// the committed rollback endpoint until explicit promotion or rollback.
     fn on_endpoint_authenticated(&mut self) {
         if !self.endpoint.is_dynamic() {
             return;
         }
         let _ = self.endpoint.on_authenticated();
-        let cur = self.remote;
-        self.release_except(&[cur]);
+        self.release_non_retained_endpoints();
     }
 
     fn on_fifo(&mut self, fd: RawFd) {
         if let Some(cmd) = fifo::read_command(fd) {
             log::info!("got data from fifo,s=[{cmd}]");
-            if cmd == "reconnect" {
-                log::info!("received command: reconnect");
-                self.endpoint.request_refresh("fifo reconnect");
-                self.go_idle(CycleReason::Forced, " (fifo reconnect)");
-            } else {
-                log::info!("unknown command");
+            let mut words = cmd.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("reconnect"), None, None) => {
+                    log::info!("received command: reconnect");
+                    self.endpoint.request_refresh("fifo reconnect");
+                    self.go_idle(CycleReason::Forced, " (fifo reconnect)");
+                }
+                (Some("promote"), Some(expected), None) => match expected.parse::<Ipv4Addr>() {
+                    Ok(expected) => match self.endpoint.promote_candidate(expected, now_ms()) {
+                        PromotionResult::Promoted { previous } => {
+                            log::warn!("received command: promote {expected}; previous committed endpoint {previous} is now releasable");
+                            self.release_non_retained_endpoints();
+                        }
+                        result => log::warn!("received command: promote {expected} rejected: {result:?}"),
+                    },
+                    Err(e) => log::warn!("received invalid promote endpoint {expected:?}: {e}"),
+                },
+                (Some("rollback"), Some(expected), None) => match expected.parse::<Ipv4Addr>() {
+                    Ok(expected) if self.endpoint.authorize_operator_rollback(expected, now_ms()) => {
+                        log::warn!("received command: rollback {expected}");
+                        self.go_idle(CycleReason::OperatorRollback, " (explicit FIFO rollback)");
+                    }
+                    Ok(expected) => log::warn!("received stale rollback {expected}; current endpoint is {}", self.remote.ip()),
+                    Err(e) => log::warn!("received invalid rollback endpoint {expected:?}: {e}"),
+                },
+                _ => log::info!("unknown command"),
             }
         }
     }
