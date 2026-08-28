@@ -271,10 +271,23 @@ resetting would refund attempts.
 #### Route/rule ownership and timing validation
 
 Protocol-235 `/32` routes and iptables rules have independent desired state and independent
-five-second repair retries. An existing rule, or inability to list it, is not evidence that
-the route exists. Cleanup bookkeeping remains until each deletion is confirmed. Routes use
-create-exclusive, per-process metrics and exact-match deletion, so two clients can share one
-relay `/32` without one deleting the other's route; operator routes are not owned or removed.
+five-second repair retries for both the active endpoint and a preserved rollback endpoint.
+An existing rule, or inability to list it, is not evidence that the route exists. Cleanup
+bookkeeping remains until each deletion is confirmed. If an endpoint becomes retained again
+after an unconfirmed deletion, the resource stays unknown: the route is reconciled with an
+IPv4 main-table dump that must match the exact `/32`, protocol 235, unicast type, gateway,
+interface, preferred source and per-process metric; the rule is reconciled against the exact
+active-chain INPUT jump, including address, protocol and port/type. Verified absence is
+recreated, verified presence is retained, and an inconclusive check remains retryable. An
+unavailable iptables listing gets one real availability-first insert attempt rather than
+being treated as proof of presence.
+
+Routes use create-exclusive, per-process metrics and exact-match deletion, so two cooperating
+clients can share one relay `/32` without one deleting the other's route; operator routes are
+not owned or removed. Linux rtnetlink has no per-process route owner cookie, so the random
+metric plus exact native-path tuple is the ownership token. A process that deliberately
+recreates that identical tuple during a lost-ACK window cannot be distinguished without a
+larger cross-process lease registry or a different kernel tagging scheme.
 
 Fallback configuration is rejected unless:
 
@@ -306,7 +319,7 @@ Failure-state summary:
 | Resolver timeout, NXDOMAIN, malformed reply or overall deadline | Keep current/last usable state; retry with backoff | Does not refund/reset persisted budgets |
 | Process crashes or restarts with unchanged/churning DNS | Reload the locked sidecar; an in-flight attempt was already charged | Per-set cooldown/cap and global bucket survive restart and set churn |
 | Cache/sidecar is oversized, malformed, wrong identity/mode/owner/type or unsafe | Reject it; DNS then safe `--bootstrap-addr` decide startup. Unsafe budget state disables blind fallback | Never follow a symlink/FIFO/device; fail closed |
-| Route or rule creation/deletion fails | Retry the two resources independently; keep failed cleanup pending | Never infer one resource from the other or delete a peer client's exact route |
+| Route or rule creation/deletion fails | Retry independently; keep failed cleanup pending; exact-reconcile an uncertain deletion before re-retaining it | Never infer one resource from the other or delete a peer client's exact route |
 | Preferred round deadline expires | Stop extending that round with more candidate handshakes | Preserve the rollback point and begin only a later bounded reconnect round |
 
 **DNS record recommendation:** publish exactly one unproxied IPv4 `A` record with a 30–60

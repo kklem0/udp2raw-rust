@@ -73,7 +73,7 @@ Threading model (the reason for the port):
 
 * Hardened fallback validation (2026-08-29): macOS `--all-targets --all-features`
   passed 119 library + 1 binary + 3 vector tests, `cargo check`, and strict Clippy;
-  Linux/arm64 passed 139 library + 1 binary + 3 vector tests, `cargo check`, and strict
+  Linux/arm64 passed 146 library + 1 binary + 3 vector tests, `cargo check`, and strict
   Clippy from a unique fresh target directory.
 * `cargo test` on macOS: 42 unit tests + `tests/vectors.rs` (golden vectors) pass.
 * `cargo check --target aarch64-unknown-linux-gnu --all-targets`: clean.
@@ -181,10 +181,17 @@ direct return from an attended cutover.
 ### Kernel ownership and timing guard
 
 Route and iptables-rule state are tracked, installed, removed and retried independently every
-five seconds. Rule existence or an unavailable rule listing is never used as proof of the
-route. Failed deletion remains in cleanup bookkeeping for retry. Protocol-235 routes use
-create-exclusive per-process metrics and exact deletion keys, so two clients and an operator
-route can share a relay `/32` without deleting each other.
+five seconds for the active and retained rollback endpoints. Rule existence or an unavailable
+rule listing is never used as proof of the route. Failed deletion remains in cleanup
+bookkeeping for retry. Re-retaining an endpoint after an unconfirmed delete leaves that
+resource unknown until an exact kernel query proves presence or absence. Route reconciliation
+matches the complete IPv4 main-table `/32` + protocol 235 + unicast + gateway/interface/
+preferred-source/metric identity; rule reconciliation matches every generated token and the
+active private-chain jump. Verified absence is recreated, an inconclusive result retries, and
+an unavailable rule listing triggers one real availability-first insert attempt rather than
+a false success. Protocol-235 routes use create-exclusive per-process metrics and exact
+deletion keys, so two clients and an operator route can share a relay `/32` without deleting
+each other.
 
 Configuration must satisfy:
 
@@ -214,7 +221,7 @@ return path expires; activity-based freshness remains authoritative.
 | Resolver/all-round deadline expires | Stop extending this round; retry later with backoff | Preserve committed state and budgets |
 | Crash/restart or churning answer sets | Reload durable locked charges/global bucket | No retry-budget refund/reset |
 | Cache/sidecar metadata, type, identity, size or content is unsafe | Reject input; blind fallback fails closed | Never follow/overwrite unsafe objects |
-| Route/rule operation fails | Retry each operation independently; retain failed cleanup | Peer-client and operator routes remain owned separately |
+| Route/rule operation fails | Retry independently; retain failed cleanup; exact-reconcile an uncertain deletion before re-retaining it | Peer-client and operator routes remain owned separately |
 
 ### Deliberately deferred
 
@@ -226,7 +233,11 @@ Runtime-health timestamps also remain process-local; restart falls back to stric
 until re-authentication. There is no automatic sidecar/schema migration: a configuration
 change such as lowering capacity below persisted tokens fails closed and requires a reviewed,
 attended migration rather than silently resetting/refunding limits. The 16-key table likewise
-refuses new keys when full instead of evicting charged history.
+refuses new keys when full instead of evicting charged history. Rtnetlink exposes no
+per-process route owner cookie; cooperating clients use an exclusive random metric plus the
+exact native-path tuple as the ownership token. Distinguishing a process that deliberately
+recreates that identical tuple during a lost-ACK window would require a future cross-process
+lease registry or a different kernel tagging scheme.
 
 ## Next session: verification on the Pis
 
