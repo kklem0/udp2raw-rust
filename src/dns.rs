@@ -479,6 +479,12 @@ pub fn check_endpoint_ip(ip: Ipv4Addr, allow_private: bool) -> Result<(), &'stat
     if ip.is_documentation() || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) {
         return Err("documentation/benchmark range");
     }
+    // IANA special-purpose blocks that are neither ordinary public unicast nor covered by
+    // the standard-library predicates above. Reject the complete blocks, including the few
+    // protocol anycast exceptions: they are not suitable relay host addresses.
+    if (o[0] == 192 && o[1] == 0 && o[2] == 0) || (o[0] == 192 && o[1] == 88 && o[2] == 99) {
+        return Err("special-purpose range");
+    }
     let private = ip.is_private();
     let cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
     if (private || cgnat) && !allow_private {
@@ -746,7 +752,22 @@ mod tests {
 
     #[test]
     fn endpoint_safety() {
-        for bad in ["0.0.0.0", "0.1.2.3", "127.0.0.1", "169.254.1.1", "224.0.0.1", "255.255.255.255", "240.0.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.1", "198.18.0.1"] {
+        for bad in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "192.0.0.8",
+            "192.0.0.170",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "198.18.0.1",
+        ] {
             assert!(check_endpoint_ip(bad.parse().unwrap(), true).is_err(), "{bad}");
         }
         for private in ["10.0.0.1", "172.16.0.1", "192.168.1.1", "100.64.0.1", "100.127.255.1"] {
