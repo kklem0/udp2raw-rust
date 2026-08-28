@@ -35,6 +35,9 @@ fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     p
 }
 
+// Index arithmetic mirrors the AES table construction and is easier to audit against the
+// specification in this form. This is an initialization path, not packet processing.
+#[allow(clippy::needless_range_loop)]
 fn gen_tables() -> Tables {
     // powers of the generator 3 give every non-zero element; inverse via logs
     let mut pow = [0u8; 256];

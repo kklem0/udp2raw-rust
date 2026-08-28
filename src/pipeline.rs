@@ -248,7 +248,7 @@ mod tests {
     }
 
     fn plain(i: u64) -> Vec<u8> {
-        build_safer(&SaferHeader { my_id: 1, oppsite_id: 2, seq: i, ptype: b'd', roller: 0 }, &vec![i as u8; 200])
+        build_safer(&SaferHeader { my_id: 1, oppsite_id: 2, seq: i, ptype: b'd', roller: 0 }, &[i as u8; 200])
     }
 
     #[test]

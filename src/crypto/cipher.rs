@@ -120,6 +120,9 @@ impl CipherMode {
 pub type Block = [u8; 16];
 
 /// One AES-128 key schedule (both directions of the block cipher).
+// Preserve the existing allocation-free representation; boxing the software schedule only
+// to equalize enum variants would change crypto-path allocation and layout.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum AesKey {
     Crate(Aes128),
