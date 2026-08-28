@@ -33,6 +33,7 @@ pub fn next_owned_metric(metric: u32) -> u32 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RouteInfo {
+    pub family: u8,
     pub destination: Option<Ipv4Addr>,
     pub gateway: Option<Ipv4Addr>,
     pub oif: Option<u32>,
@@ -41,6 +42,7 @@ pub struct RouteInfo {
     pub dst_len: u8,
     pub table: u8,
     pub protocol: u8,
+    pub route_type: u8,
 }
 
 const NLMSG_HDRLEN: usize = 16;
@@ -149,7 +151,26 @@ impl Netlink {
                             }
                             return Ok(replies); // ACK
                         }
-                        x if x == libc::NLMSG_DONE as u16 => return Ok(replies),
+                        x if x == libc::NLMSG_DONE as u16 => {
+                            if flags & libc::NLM_F_DUMP_INTR as u16 != 0 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "netlink: route dump was interrupted",
+                                ));
+                            }
+                            if payload.len() >= 4 {
+                                let code = i32::from_ne_bytes(payload[..4].try_into().unwrap());
+                                if code != 0 {
+                                    let errno = code.checked_neg().filter(|e| *e > 0).unwrap_or(libc::EIO);
+                                    return Err(io::Error::from_raw_os_error(errno));
+                                }
+                            }
+                            return Ok(replies);
+                        }
+                        x if x == libc::NLMSG_OVERRUN as u16 => {
+                            return Err(io::Error::other("netlink: route dump overrun"));
+                        }
+                        x if x == libc::NLMSG_NOOP as u16 => {}
                         _ => {
                             replies.push(payload.to_vec());
                             if flags & libc::NLM_F_MULTI as u16 == 0 {
@@ -176,9 +197,11 @@ fn parse_route(payload: &[u8]) -> io::Result<RouteInfo> {
         return Err(io::Error::other("netlink: short rtmsg"));
     }
     let mut info = RouteInfo {
+        family: payload[0],
         dst_len: payload[1],
         table: payload[4],
         protocol: payload[5],
+        route_type: payload[7],
         ..RouteInfo::default()
     };
     let mut off = RTMSG_LEN;
@@ -217,6 +240,72 @@ pub fn get_route(dst: Ipv4Addr, oif: Option<u32>) -> io::Result<RouteInfo> {
         Some(p) => parse_route(p),
         None => Err(io::Error::other("netlink: no route in reply")),
     }
+}
+
+fn owned_route_dump_body() -> Vec<u8> {
+    // A dump is required rather than an ordinary lookup: RTM_GETROUTE for one destination
+    // returns only the route the kernel would select, which may be an operator or peer route
+    // and cannot prove whether our exact metric still exists after a lost delete ACK.
+    rtmsg(0, libc::RT_TABLE_MAIN, 0, 0, 0).to_vec()
+}
+
+fn owned_host_route_matches(
+    info: &RouteInfo,
+    dst: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+    oif: u32,
+    prefsrc: Option<Ipv4Addr>,
+    metric: u32,
+) -> bool {
+    info.family == libc::AF_INET as u8
+        && info.destination == Some(dst)
+        && info.dst_len == 32
+        && info.table == libc::RT_TABLE_MAIN
+        && info.protocol == RTPROT_UDP2RAW
+        && info.route_type == libc::RTN_UNICAST
+        && info.gateway == gateway
+        && info.oif == Some(oif)
+        && info.prefsrc == prefsrc
+        && info.metric == Some(metric)
+}
+
+fn owned_host_route_in_payloads(
+    payloads: &[Vec<u8>],
+    dst: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+    oif: u32,
+    prefsrc: Option<Ipv4Addr>,
+    metric: u32,
+) -> io::Result<bool> {
+    for payload in payloads {
+        let info = parse_route(payload)?;
+        if owned_host_route_matches(&info, dst, gateway, oif, prefsrc, metric) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether this process's exact protocol-235 host route is currently present.
+///
+/// This dumps the IPv4 main table and requires every ownership and native-path field to
+/// match. In particular, a selected operator route, another client's route for the same
+/// `/32`, or a route with the same metric on a different gateway/interface cannot satisfy
+/// reconciliation after an uncertain delete result.
+pub fn owned_host_route_exists(
+    dst: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
+    oif: u32,
+    prefsrc: Option<Ipv4Addr>,
+    metric: u32,
+) -> io::Result<bool> {
+    let mut nl = Netlink::open()?;
+    let replies = nl.request(
+        libc::RTM_GETROUTE,
+        libc::NLM_F_DUMP as u16,
+        &owned_route_dump_body(),
+    )?;
+    owned_host_route_in_payloads(&replies, dst, gateway, oif, prefsrc, metric)
 }
 
 fn host_route_body(
@@ -302,12 +391,14 @@ mod tests {
         assert_eq!(&c[..2], &7u16.to_ne_bytes());
         // parse back what the kernel would send
         let info = parse_route(&b).unwrap();
+        assert_eq!(info.family, libc::AF_INET as u8);
         assert_eq!(info.destination, Some(Ipv4Addr::new(10, 99, 1, 20)));
         assert_eq!(info.oif, Some(7));
         assert_eq!(info.metric, Some(metric));
         assert_eq!(info.dst_len, 32);
         assert_eq!(info.table, libc::RT_TABLE_MAIN);
         assert_eq!(info.protocol, RTPROT_UDP2RAW);
+        assert_eq!(info.route_type, libc::RTN_UNICAST);
         assert_eq!(info.gateway, None);
         let mut with_gw = body.to_vec();
         push_attr(&mut with_gw, libc::RTA_GATEWAY, &[10, 99, 0, 2]);
@@ -353,6 +444,135 @@ mod tests {
         let create_flags = (libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_EXCL) as u16;
         assert_ne!(create_flags & libc::NLM_F_EXCL as u16, 0);
         assert_eq!(create_flags & libc::NLM_F_REPLACE as u16, 0);
+    }
+
+    #[test]
+    fn owned_route_dump_request_is_main_table_ipv4_multipart() {
+        let body = owned_route_dump_body();
+        let parsed = parse_route(&body).unwrap();
+        assert_eq!(parsed.family, libc::AF_INET as u8);
+        assert_eq!(parsed.dst_len, 0);
+        assert_eq!(parsed.table, libc::RT_TABLE_MAIN);
+        assert_eq!(parsed.protocol, 0);
+        assert_eq!(parsed.route_type, 0);
+        assert_eq!(parsed.destination, None);
+
+        let flags = libc::NLM_F_REQUEST as u16 | libc::NLM_F_DUMP as u16;
+        let request = message(libc::RTM_GETROUTE, flags, 17, &body);
+        assert_eq!(u16::from_ne_bytes(request[4..6].try_into().unwrap()), libc::RTM_GETROUTE);
+        assert_eq!(u16::from_ne_bytes(request[6..8].try_into().unwrap()), flags);
+        assert_ne!(flags & libc::NLM_F_ROOT as u16, 0);
+        assert_ne!(flags & libc::NLM_F_MATCH as u16, 0);
+    }
+
+    #[test]
+    fn owned_route_match_requires_every_identity_and_path_field() {
+        let dst = Ipv4Addr::new(47, 243, 1, 2);
+        let gateway = Some(Ipv4Addr::new(192, 0, 2, 1));
+        let prefsrc = Some(Ipv4Addr::new(192, 0, 2, 9));
+        let metric = owned_metric(99);
+        let exact = parse_route(&host_route_body(
+            dst,
+            gateway,
+            11,
+            prefsrc,
+            metric,
+            libc::RT_SCOPE_UNIVERSE,
+        ))
+        .unwrap();
+        assert!(owned_host_route_matches(&exact, dst, gateway, 11, prefsrc, metric));
+
+        let mut changed = exact;
+        changed.family = libc::AF_INET6 as u8;
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.destination = Some(Ipv4Addr::new(47, 243, 1, 3));
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.dst_len = 24;
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.table = libc::RT_TABLE_LOCAL;
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.protocol = libc::RTPROT_STATIC;
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.route_type = libc::RTN_BLACKHOLE;
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.gateway = Some(Ipv4Addr::new(192, 0, 2, 2));
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.oif = Some(12);
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.prefsrc = Some(Ipv4Addr::new(192, 0, 2, 10));
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+        changed = exact;
+        changed.metric = Some(next_owned_metric(metric));
+        assert!(!owned_host_route_matches(&changed, dst, gateway, 11, prefsrc, metric));
+    }
+
+    #[test]
+    fn owned_route_dump_ignores_operator_and_peer_routes() {
+        let dst = Ipv4Addr::new(47, 243, 9, 9);
+        let gateway = Some(Ipv4Addr::new(192, 0, 2, 1));
+        let prefsrc = Some(Ipv4Addr::new(192, 0, 2, 9));
+        let metric = owned_metric(0x101);
+        let peer = host_route_body(
+            dst,
+            gateway,
+            7,
+            prefsrc,
+            next_owned_metric(metric),
+            libc::RT_SCOPE_UNIVERSE,
+        );
+        let mut operator = host_route_body(
+            dst,
+            gateway,
+            7,
+            prefsrc,
+            metric,
+            libc::RT_SCOPE_UNIVERSE,
+        );
+        operator[5] = libc::RTPROT_STATIC;
+        assert!(!owned_host_route_in_payloads(
+            &[peer.clone(), operator.clone()],
+            dst,
+            gateway,
+            7,
+            prefsrc,
+            metric,
+        )
+        .unwrap());
+
+        let exact = host_route_body(
+            dst,
+            gateway,
+            7,
+            prefsrc,
+            metric,
+            libc::RT_SCOPE_UNIVERSE,
+        );
+        assert!(owned_host_route_in_payloads(
+            &[peer, operator, exact],
+            dst,
+            gateway,
+            7,
+            prefsrc,
+            metric,
+        )
+        .unwrap());
+        assert!(owned_host_route_in_payloads(
+            &[vec![0u8; 5]],
+            dst,
+            gateway,
+            7,
+            prefsrc,
+            metric,
+        )
+        .is_err());
     }
 
     #[test]

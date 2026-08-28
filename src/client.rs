@@ -87,7 +87,7 @@ impl Underlay {
 
 #[cfg(test)]
 mod endpoint_resource_tests {
-    use super::{EndpointResources, ManagedState};
+    use super::{EndpointResources, ManagedState, ReconcileResult};
 
     #[test]
     fn every_route_rule_add_failure_combination_retries_independently() {
@@ -203,15 +203,93 @@ mod endpoint_resource_tests {
     }
 
     #[test]
-    fn pending_cleanup_can_be_cancelled_and_missing_piece_reinstalled() {
-        let mut state = EndpointResources::new(true, true);
-        state.attempt_adds(|| true, || true);
+    fn uncertain_route_deletion_is_reconciled_before_immediate_reinstall() {
+        let mut state = EndpointResources::new(true, false);
+        state.attempt_adds(|| true, || unreachable!());
         state.begin_release();
-        state.attempt_cleanup(|| true, || false);
+        // Model a route deletion that took effect in the kernel but whose ACK was lost.
+        state.attempt_cleanup(|| false, || unreachable!());
+        assert_eq!(state.route, ManagedState::Removing);
+
+        state.cancel_release();
+        let mut route_adds = 0;
+        state.attempt_adds(
+            || {
+                route_adds += 1;
+                true
+            },
+            || unreachable!(),
+        );
+        assert_eq!(route_adds, 0, "an unverified deletion must not be treated as absent or present");
+
+        let mut route_reconciles = 0;
+        state.attempt_reconcile_for_retain(
+            || {
+                route_reconciles += 1;
+                ReconcileResult::Absent
+            },
+            || unreachable!(),
+        );
         assert_eq!(state.route, ManagedState::Missing);
+        state.attempt_adds(
+            || {
+                route_adds += 1;
+                true
+            },
+            || unreachable!(),
+        );
+        assert_eq!(state.route, ManagedState::Present);
+        assert_eq!(route_reconciles, 1);
+        assert_eq!(route_adds, 1);
+    }
+
+    #[test]
+    fn uncertain_rule_deletion_is_reconciled_before_immediate_reinstall() {
+        let mut state = EndpointResources::new(false, true);
+        state.attempt_adds(|| unreachable!(), || true);
+        state.begin_release();
+        // Model `iptables -D` succeeding followed by an unavailable `iptables -S` check.
+        state.attempt_cleanup(|| unreachable!(), || false);
         assert_eq!(state.rule, ManagedState::Removing);
 
         state.cancel_release();
+        let mut rule_reconciles = 0;
+        let mut rule_adds = 0;
+        state.attempt_reconcile_for_retain(
+            || unreachable!(),
+            || {
+                rule_reconciles += 1;
+                ReconcileResult::Absent
+            },
+        );
+        assert_eq!(state.rule, ManagedState::Missing);
+        state.attempt_adds(
+            || unreachable!(),
+            || {
+                rule_adds += 1;
+                true
+            },
+        );
+        assert_eq!(state.rule, ManagedState::Present);
+        assert_eq!(rule_reconciles, 1);
+        assert_eq!(rule_adds, 1);
+    }
+
+    #[test]
+    fn uncertain_resources_remain_unknown_or_accept_verified_presence_independently() {
+        let mut state = EndpointResources::new(true, true);
+        state.attempt_adds(|| true, || true);
+        state.begin_release();
+        state.attempt_cleanup(|| false, || false);
+        state.cancel_release();
+
+        state.attempt_reconcile_for_retain(
+            || ReconcileResult::Unknown,
+            || ReconcileResult::Present,
+        );
+        assert_eq!(state.route, ManagedState::Removing);
+        assert_eq!(state.rule, ManagedState::Present);
+
         let mut route_adds = 0;
         let mut rule_adds = 0;
         state.attempt_adds(
@@ -224,9 +302,7 @@ mod endpoint_resource_tests {
                 true
             },
         );
-        assert_eq!(state.route, ManagedState::Present);
-        assert_eq!(state.rule, ManagedState::Present);
-        assert_eq!(route_adds, 1);
+        assert_eq!(route_adds, 0);
         assert_eq!(rule_adds, 0);
     }
 }
@@ -240,6 +316,16 @@ enum ManagedState {
     Present,
     /// Deletion was requested but has not yet been confirmed.
     Removing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileResult {
+    /// Exact kernel state proves that the resource still exists.
+    Present,
+    /// Exact kernel state proves that the resource is absent and may be recreated.
+    Absent,
+    /// Presence could not be determined; neither assume ownership nor create a duplicate.
+    Unknown,
 }
 
 /// Pure route/rule state. The callbacks deliberately run independently: failure of one
@@ -294,11 +380,33 @@ impl EndpointResources {
 
     fn cancel_release(&mut self) {
         self.releasing = false;
+        // Keep `Removing` as an explicitly uncertain state. A deletion may have taken
+        // effect even when its ACK or post-delete verification failed, so re-retaining the
+        // endpoint must confirm absence and recreate the resource instead of assuming it
+        // is still present.
+    }
+
+    fn attempt_reconcile_for_retain<R, I>(&mut self, mut reconcile_route: R, mut reconcile_rule: I)
+    where
+        R: FnMut() -> ReconcileResult,
+        I: FnMut() -> ReconcileResult,
+    {
+        if self.releasing {
+            return;
+        }
         if self.route == ManagedState::Removing {
-            self.route = ManagedState::Present;
+            self.route = match reconcile_route() {
+                ReconcileResult::Present => ManagedState::Present,
+                ReconcileResult::Absent => ManagedState::Missing,
+                ReconcileResult::Unknown => ManagedState::Removing,
+            };
         }
         if self.rule == ManagedState::Removing {
-            self.rule = ManagedState::Present;
+            self.rule = match reconcile_rule() {
+                ReconcileResult::Present => ManagedState::Present,
+                ReconcileResult::Absent => ManagedState::Missing,
+                ReconcileResult::Unknown => ManagedState::Removing,
+            };
         }
     }
 
@@ -879,8 +987,19 @@ impl Client {
         let now = now_ms();
         if now.saturating_sub(self.last_kernel_retry_ms) >= KERNEL_RESOURCE_RETRY_MS {
             self.last_kernel_retry_ms = now;
-            let current = self.remote;
-            self.ensure_installed(current);
+            let port = self.remote.port();
+            // Always retain the actual remote, including literal IPv6 endpoints. Dynamic
+            // IPv4 endpoints may additionally preserve a committed rollback address.
+            let mut retained = vec![self.remote];
+            for ip in self.endpoint.retained_addresses() {
+                let addr = SocketAddr::new(IpAddr::V4(ip), port);
+                if !retained.contains(&addr) {
+                    retained.push(addr);
+                }
+            }
+            for addr in retained {
+                self.ensure_installed(addr);
+            }
             self.retry_cleanup();
         }
         for (conv, _) in self.convs.clear_inactive(now) {
@@ -1169,6 +1288,33 @@ impl Client {
         let ipt = self.ipt.clone();
         let rule_pattern = self.installed[pos].rule_pattern.clone();
         let mut metric = self.installed[pos].route_metric;
+        self.installed[pos].resources.attempt_reconcile_for_retain(
+            || match (&underlay, addr.ip()) {
+                (Some(u), IpAddr::V4(v4)) => match route::owned_host_route_exists(v4, u.gateway, u.ifindex, u.prefsrc, metric) {
+                    Ok(true) => ReconcileResult::Present,
+                    Ok(false) => ReconcileResult::Absent,
+                    Err(e) => {
+                        log::warn!(
+                            "route: could not verify uncertain {v4}/32 state on {} metric {metric}: {e}; installation will retry",
+                            u.dev
+                        );
+                        ReconcileResult::Unknown
+                    }
+                },
+                _ => ReconcileResult::Unknown,
+            },
+            || match (&ipt, &rule_pattern) {
+                (Some(ipt), Some(pattern)) => match ipt.reconcile_pattern(pattern) {
+                    Ok(true) => ReconcileResult::Present,
+                    Ok(false) => ReconcileResult::Absent,
+                    Err(e) => {
+                        log::warn!("{e}; uncertain rule state will be reconciled before reinstall");
+                        ReconcileResult::Unknown
+                    }
+                },
+                _ => ReconcileResult::Unknown,
+            },
+        );
         self.installed[pos].resources.attempt_adds(
             || match &underlay {
                 Some(u) => Self::install_owned_route(u, addr, &mut metric),
