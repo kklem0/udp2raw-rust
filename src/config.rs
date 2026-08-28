@@ -22,6 +22,10 @@ struct Cli {
     remote: Option<String>,
     #[arg(short = 'k', long = "key")]
     key: Option<String>,
+    /// Read the password from a file instead of `-k` (keeps it out of the process list;
+    /// point it at a systemd credential, e.g. `--key-file %d/udp2raw-key`).
+    #[arg(long = "key-file")]
+    key_file: Option<String>,
     #[arg(short = 'a', long = "auto-rule")]
     auto_rule: bool,
     #[arg(short = 'g', long = "gen-rule")]
@@ -222,6 +226,13 @@ usage:
 common options,these options must be same on both side:
     --raw-mode            <string>        available values:faketcp(default),udp,icmp and easy-faketcp
     -k,--key              <string>        password to gen symetric key,default:\"secret key\"
+                                          (visible in the process list; prefer --key-file)
+    --key-file            <path>          read the password from a file instead of -k. The file's
+                                          content is the key (one trailing newline is stripped).
+                                          For a systemd credential: LoadCredential=udp2raw-key:/path
+                                          and --key-file %d/udp2raw-key . Rust build only; the key
+                                          derivation and wire format are unchanged, so it interops
+                                          with a -k peer using the same password.
     --cipher-mode         <string>        available values:aes128cfb,aes128cbc(default),xor,none,
                                           chacha20poly1305 (udp2raw-rust only, both ends; AEAD, no --auth-mode)
     --auth-mode           <string>        available values:hmac_sha1,md5(default),crc32,simple,none
@@ -361,6 +372,24 @@ fn parse_dns_server(s: &str) -> Result<SocketAddr, String> {
         return Ok(SocketAddr::new(ip, 53));
     }
     Err(format!("invalid --dns-server {s}, expected ip or ip:port"))
+}
+
+/// Read the password from a file (`--key-file`, incl. a systemd credential). The content is
+/// the key verbatim except one trailing newline (`\n` or `\r\n`) is stripped, so
+/// `echo secret > key` works. Errors on a missing/unreadable file, non-UTF-8, or an empty
+/// key (almost always a broken credential — safer to refuse than to run with no key).
+fn read_key_file(path: &str) -> Result<String, String> {
+    let mut bytes = std::fs::read(path).map_err(|e| format!("--key-file {path}: {e}"))?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.is_empty() {
+        return Err(format!("--key-file {path} produced an empty key"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("--key-file {path}: key is not valid UTF-8"))
 }
 
 fn parse_mac(s: &str) -> Result<[u8; 6], String> {
@@ -537,6 +566,12 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
     if !(0..=6).contains(&log_level) {
         return Err("invalid log_level".into());
     }
+    let key = match (&cli.key, &cli.key_file) {
+        (Some(_), Some(_)) => return Err("specify only one of -k/--key and --key-file".into()),
+        (Some(k), None) => k.clone(),
+        (None, Some(path)) => read_key_file(path)?,
+        (None, None) => "secret key".to_string(),
+    };
     let mut auto_rule = cli.auto_rule;
     let mut gen_rule = cli.gen_rule;
     if auto_rule && gen_rule {
@@ -575,7 +610,7 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         allow_private_endpoint: cli.allow_private_endpoint,
         endpoint_cache,
         bootstrap_addr,
-        key: cli.key.clone().unwrap_or_else(|| "secret key".to_string()),
+        key,
         raw_mode,
         easy_faketcp: easy,
         cipher_mode,
@@ -634,6 +669,37 @@ mod tests {
         assert_eq!(parse_conf_line("# comment").unwrap(), Vec::<String>::new());
         assert_eq!(parse_conf_line("").unwrap(), Vec::<String>::new());
         assert!(parse_conf_line("aaa").is_err());
+    }
+
+    #[test]
+    fn key_file_and_precedence() {
+        let dir = std::env::temp_dir().join(format!("udp2raw-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kf = dir.join("k");
+        let base = "-c -l 127.0.0.1:3333 -r 1.2.3.4:4096";
+        std::fs::write(&kf, b"filekey\n").unwrap(); // trailing newline stripped
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else { panic!() };
+        assert_eq!(cfg.key, "filekey");
+        // -k still works, default preserved
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} -k plainkey"))).unwrap() else { panic!() };
+        assert_eq!(cfg.key, "plainkey");
+        let ParseOutcome::Run(cfg) = parse_args(&args(base)).unwrap() else { panic!() };
+        assert_eq!(cfg.key, "secret key");
+        // CRLF stripped
+        std::fs::write(&kf, b"crlfkey\r\n").unwrap();
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else { panic!() };
+        assert_eq!(cfg.key, "crlfkey");
+        // key with an embedded space (only the newline is stripped, not inner whitespace)
+        std::fs::write(&kf, b"a b c\n").unwrap();
+        let ParseOutcome::Run(cfg) = parse_args(&args(&format!("{base} --key-file {}", kf.display()))).unwrap() else { panic!() };
+        assert_eq!(cfg.key, "a b c");
+        // errors: both, missing, empty
+        assert!(parse_args(&args(&format!("{base} -k x --key-file {}", kf.display()))).is_err());
+        assert!(parse_args(&args(&format!("{base} --key-file {}/does-not-exist", dir.display()))).is_err());
+        let ek = dir.join("empty");
+        std::fs::write(&ek, b"").unwrap();
+        assert!(parse_args(&args(&format!("{base} --key-file {}", ek.display()))).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

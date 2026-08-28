@@ -20,6 +20,15 @@ pub use cipher::{AesBackend, AesKey, CipherMode, cpu_has_aes, resolve_backend};
 use crate::consts::MAX_DATA_LEN;
 use cipher::{pad16, unpad16, xor_in_place};
 
+/// A short, non-reversible fingerprint of key material for logs: the first 4 bytes of its
+/// SHA-256, hex. Two ends can compare fingerprints to confirm they share a key without the
+/// key (or a derived key) ever appearing in a log.
+pub fn fingerprint(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
+}
+
 pub const HMAC_KEY_LEN: usize = 64;
 pub const CIPHER_KEY_LEN: usize = 64;
 
@@ -321,6 +330,14 @@ impl Crypto {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fingerprint_is_short_stable_and_distinct() {
+        assert_eq!(fingerprint(b"secret key").len(), 8);
+        assert_eq!(fingerprint(b"abc"), fingerprint(b"abc"));
+        assert_ne!(fingerprint(b"abc"), fingerprint(b"abd"));
+        assert!(fingerprint(b"abc").bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
     use super::*;
 
     fn pair(cm: CipherMode, am: AuthMode) -> (Crypto, Crypto) {

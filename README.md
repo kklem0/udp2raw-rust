@@ -74,6 +74,40 @@ sudo ./udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:51820 -k "passwd" --raw-mode fake
 sudo ./udp2raw -c -l 127.0.0.1:3333 -r 44.55.66.77:4096 -k "passwd" --raw-mode faketcp -a
 ```
 
+### The password / key
+
+The key is never written to a log. `-k`/`--key` still works exactly as in the C++ (and is
+interoperable with a C++ peer using the same password), but the value is redacted from the
+`argv:` and `important variables:` lines and a warning notes that a `-k` key is visible in
+the process list (`ps`, `/proc/<pid>/cmdline`). Instead the logs print a **fingerprint** —
+the first four bytes of `SHA-256(key)`, hex — so two ends can confirm they share a key
+without it ever appearing:
+
+```
+key fingerprint (sha256[..4]): bb06c3ea — both ends must match
+```
+
+Derived key material is logged the same way (fingerprints, not the bytes) at `--log-level 6`.
+
+**`--key-file <path>`** reads the password from a file instead of `-k`, keeping it out of the
+process list. The file's content is the key verbatim except one trailing newline (`\n` or
+`\r\n`) is stripped, so `printf %s "$KEY" > key` and `echo "$KEY" > key` both work; an empty
+file is rejected. It is a Rust-build-only convenience — the key, the derivation and the wire
+format are unchanged, so a `--key-file` client interoperates with a `-k` C++ or Rust peer
+that uses the same password.
+
+**systemd credentials.** A systemd credential is a file in `$CREDENTIALS_DIRECTORY`, so point
+`--key-file` at it with the `%d` specifier:
+
+```ini
+[Service]
+LoadCredential=udp2raw-key:/etc/udp2raw/key       # 0600, root-owned
+ExecStart=/opt/udp2raw -c -l 127.0.0.1:3333 -r relay.example.com:8443 \
+    --raw-mode faketcp -a --key-file %d/udp2raw-key
+```
+
+The key then never appears in the unit file, the process list, or the logs.
+
 ### Hostname endpoints (client `-r`, in-process relay switching)
 
 A client `-r` may be a hostname. The client resolves it through the DNS servers you give
