@@ -504,18 +504,22 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
         }
     }
     let mut auth_mode = AuthMode::Md5;
-    let mut disable_anti_replay = cli.disable_anti_replay;
     if let Some(s) = &cli.auth_mode {
         auth_mode = AuthMode::parse(s).ok_or_else(|| format!("no such auth_mode {s}"))?;
-        if auth_mode == AuthMode::None {
-            disable_anti_replay = true;
-        }
     }
+    let mut disable_anti_replay = cli.disable_anti_replay;
     if cipher_mode.is_aead() {
+        // An AEAD authenticates every packet itself, so --auth-mode is ignored -- and, crucially,
+        // anti-replay stays meaningful because the in-plaintext sequence number is covered by the
+        // tag. It must NOT be disabled just because --auth-mode none was passed (it is a no-op here).
         if cli.auth_mode.is_some() && auth_mode != AuthMode::None {
             log::warn!("--auth-mode {} ignored: {} authenticates every packet itself", auth_mode.name(), cipher_mode.name());
         }
         auth_mode = AuthMode::None;
+    } else if auth_mode == AuthMode::None {
+        // No authentication: an attacker can forge the sequence number, so anti-replay would be
+        // pointless -- disable it, matching the C++.
+        disable_anti_replay = true;
     }
     let source_ip = match &cli.source_ip {
         Some(s) => Some(s.parse::<IpAddr>().map_err(|_| format!("ip_addr {s} is invalid"))?),
@@ -800,6 +804,21 @@ mod tests {
         assert_eq!(c.cipher_mode, CipherMode::ChaCha20Poly1305);
         assert_eq!(c.auth_mode, AuthMode::None);
         assert!(!c.disable_anti_replay);
+    }
+
+    #[test]
+    fn aead_keeps_anti_replay_even_with_explicit_auth_none() {
+        // regression: `--auth-mode none` (a no-op in AEAD mode) must not disable anti-replay,
+        // since the AEAD tag authenticates the sequence number.
+        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --auth-mode none")).unwrap() else { panic!() };
+        assert_eq!(c.auth_mode, AuthMode::None);
+        assert!(!c.disable_anti_replay, "AEAD authenticates, so --auth-mode none must not disable anti-replay");
+        // --disable-anti-replay is still honoured with an AEAD cipher
+        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode chacha20poly1305 --disable-anti-replay")).unwrap() else { panic!() };
+        assert!(c.disable_anti_replay);
+        // legacy behaviour unchanged: a non-AEAD cipher with --auth-mode none still disables it
+        let ParseOutcome::Run(c) = parse_args(&args("-c -l 1.1.1.1:1 -r 2.2.2.2:2 --cipher-mode aes128cbc --auth-mode none")).unwrap() else { panic!() };
+        assert!(c.disable_anti_replay, "no authentication -> anti-replay disabled");
     }
 
     #[test]
