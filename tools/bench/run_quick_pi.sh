@@ -24,7 +24,8 @@ restore() {
     sleep 1
     echo "# restored rmem_max=$(sysctl -n net.core.rmem_max) wmem_max=$(sysctl -n net.core.wmem_max) governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
     echo "# leftover bench processes: $(pgrep -a -f 'udpbench|udp_echo|udp_probe|/bench/udp2raw' | wc -l); udp2raw processes: $(pgrep -a udp2raw | paste -sd';')"
-    echo "# udp2raw-test-site-1.service: $(systemctl is-active udp2raw-test-site-1.service 2>/dev/null); wg1 latest handshake: $(wg show wg1 latest-handshakes 2>/dev/null | awk -v now="$(date +%s)" '{print now-$2 "s ago"}' | paste -sd,)"
+    local svc=${PROD_SVC:-udp2raw.service}   # set PROD_SVC to your deployed unit to health-check it after a run
+    echo "# $svc: $(systemctl is-active "$svc" 2>/dev/null); wg1 latest handshake: $(wg show wg1 latest-handshakes 2>/dev/null | awk -v now="$(date +%s)" '{print now-$2 "s ago"}' | paste -sd,)"
     echo "# done $(date -Is) temp=$(temp_c)C"
 }
 trap restore EXIT

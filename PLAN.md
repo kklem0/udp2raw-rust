@@ -24,7 +24,6 @@ how to test on the Pis. Keep the **Status** section current.
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
 | Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below |
 | Pi 5 measurements (same box swapped to a Pi 5; hardware AES + mmsg confirmed by auto-detection) | **done 2026-08-28** — see "Raspberry Pi 5" below; a two-box measurement still to do |
-| **Production on `test-site-1`** (`udp2raw-test-site-1.service`, faketcp client to the VPS, WireGuard inside) | **`0e0b3fa`** (`/opt/udp2raw-rust-0e0b3fa-arm64`, unchanged conf; on the Pi 4 `--syscalls auto`→single, now on the Pi 5 →mmsg + hardware AES); replaced `60a36d6`. See "Deployment" below |
 
 Docker e2e results are appended at the bottom of this file after each run.
 
@@ -112,61 +111,17 @@ pair in a network namespace (also C++ interop across it).
 * `--syscalls auto` = LSE-atomics hwcap (ARMv8.1+ → `mmsg`), otherwise the running kernel's
   config (`/boot/config-<release>`: software PAN off → `mmsg`, on or unreadable → `single`);
   the reason is logged at startup. `/proc/config.gz` is not read (would need zlib).
-* **Measure again**: the deployment shape (Pi client ↔ VPS server over eth0) and the Pi 5
-  (hardware PAN and AES: expect `mmsg` + `hw`). `bench.sh quick` in Docker is the ~1 min
-  regression check; `tools/bench/run_quick_pi.sh` the ~30 s-per-case Pi check (`FIXED=<pps>`
-  gives the user/sys split per daemon); `tools/bench/sysprof_pi.sh` the syscall/PMU profile.
+* **Measure a real two-box deployment** (a Pi client and a remote server, traffic over a real
+  NIC rather than loopback) — still the one setup not covered. `bench.sh quick` in Docker is
+  the ~1 min regression check; `tools/bench/run_quick_pi.sh` the ~30 s-per-case single-box
+  check (`FIXED=<pps>` gives the user/sys split per daemon); `tools/bench/sysprof_pi.sh` the
+  syscall/PMU profile.
 * TPACKET_V3 ring for RX; write headers into headroom of the job buffer to drop the last
   copy on the TX path.
 * CBC decrypt already batches blocks (`decrypt_blocks`); CBC encrypt is inherently serial.
 * IPv6 e2e (`-l [::1]:4096`) — needs `ip6tables` in the container; not needed for now.
 * The fifo only supports `reconnect` (same as the C++).
 * Logging goes to stdout with the C++ format; `--log-position` prints file:line.
-
-## Deployment (test-site-1 client, 2026-08-28)
-
-**Current production: `1128cd5` (merged `main`, PR #1) with a DNS hostname endpoint.**
-The unit runs `/opt/udp2raw-rust-1128cd5-arm64 --conf-file /etc/udp2raw/test-site-1.conf
---threads 2`; the conf's `-r` is now `relay.example.com:8443` with
-`--dns-server 223.5.5.5:53 --dns-server 223.6.6.6:53 --underlay-dev eth0` (AliDNS, reached
-directly over eth0; `relay.example.com` A = `203.0.113.10`, the VPS). On the Pi 5 `auto` gives
-`syscalls: mmsg` + `aes backend: hardware`. Deployed 2026-08-28 after: `--unit-test`, then a
-smoke run of the exact hostname conf as a second client (spare `-l` port) against the real
-VPS that resolved via eth0, installed the `/32` (proto 235), reached `client_ready` in ~1 s
-and cleaned up; then a cutover script with automatic rollback (wg1 re-handshaked, `ping
-10.66.0.1` 0 % loss). The old binary `0e0b3fa`, the literal-`-r` conf backup
-(`/root/bench/test-site-1.conf.bak-literal-*`) and the unit backup
-(`/root/bench/udp2raw-test-site-1.service.bak-0e0b3fa`) are kept for rollback. The unit's
-`ExecStartPre` still installs a static `/32` for `203.0.113.10` (metric 10) — harmless: the
-daemon installs its own metric-5 proto-235 `/32`, and if the DNS record ever moves the
-feature re-resolves and re-routes while the stale static `/32` is just an unused route.
-Rollback = restore the two backups, `daemon-reload`, `restart`.
-
-### Earlier: literal-endpoint deployment (Pi 4, `0e0b3fa`, 2026-08-28 01:28)
-
-
-Convention: hash-named binaries in `/opt` (`udp2raw-rust-<short hash>-arm64`, built by
-`cargo build --release` in the arm64 dev container from a clean checkout), the systemd unit
-`/etc/systemd/system/udp2raw-test-site-1.service` points at one of them
-(`ExecStart=/opt/udp2raw-rust-<hash>-arm64 --conf-file /etc/udp2raw/test-site-1.conf --threads 2`);
-the conf does not name `--syscalls`/`--aes-backend`, so `auto` applies (single + table on
-this CPU, logged at level 4 — the conf runs at level 3, so verify with a tracepoint sample
-or a smoke run instead). Procedure used:
-
-1. `--unit-test` on the box, then a smoke run as a *second* client against the real server
-   with a copy of the conf on another `-l` port (7001 was taken by an unrelated listener;
-   `ss -lun` first) and `--log-level 4`: `client_ready` within a second, iptables rule removed
-   on exit. Delete the copy afterwards (it holds the key).
-2. Back up the unit, `sed` the `ExecStart` path, `daemon-reload`, `restart`; wait for the
-   wg1 handshake (8 s), `ping 10.66.0.1` (0 % loss at 12 ms), check the journal.
-   Rollback = restore the backup unit (`/root/bench/udp2raw-test-site-1.service.bak-60a36d6`),
-   `daemon-reload`, `restart`; the previous binary stays in `/opt`.
-3. Live check of the syscall mode: tracefs `raw_syscalls` on the main PID for 2 s showed
-   only `sendto`/`recvfrom`/`epoll_pwait`/`read`/`futex` — no mmsg calls.
-
-Known, pre-existing: the client logs `WARN unexpected adress <ip> <server ip> <port>
-<server port>` (~50/day) when a foreign TCP packet reaches its raw socket — ignored
-packets, same message as the C++.
 
 ## Wire-format reference (for debugging)
 
@@ -188,11 +143,11 @@ chacha20poly1305 (Rust only): [nonce 24, random][XChaCha20-Poly1305(plain)][tag 
 
 ## Raspberry Pi 4 benchmark (2026-08-27)
 
-Box: `test-site-1`, Raspberry Pi 4 (Cortex-A72 ×4, 1.8 GHz, no AES/SHA instructions), Ubuntu
-24.04, kernel 6.8. It is a live router (dnsmasq, VLANs, WireGuard, a 38-rule INPUT chain,
-conntrack) running the production `udp2raw-fb13730-arm64-hw-aes-static` as a client; the
-benchmark used separate ports on loopback and never touched that instance. C++ reference =
-that production binary (on the Pi 4 it uses the portable C AES). Rust = this repo at
+Box: test-site-1, a Raspberry Pi 4 (Cortex-A72 ×4, 1.8 GHz, no AES/SHA instructions), Ubuntu
+24.04, kernel 6.8. It is a busy box (a home router: NAT, VLANs, a VPN, a large firewall
+chain) that was also running an unrelated udp2raw instance; the benchmark used separate
+loopback ports and never touched it. C++ reference = a stock udp2raw build (on the Pi 4 it
+uses the portable C AES). Rust = this repo at
 `7b12ba1` (table AES). Tools: `tools/bench/` (static `udpbench` generator/sink,
 `bench_ndr.sh`, `run_ndr_pi.sh`); raw logs in `docs/bench/`.
 
@@ -230,7 +185,7 @@ What the numbers mean:
 * **This box saturates in the kernel at ≈10k tunnel packets/s (~100 Mbit/s of 1300-byte
   datagrams)**: above that the received rate stops growing regardless of offered load while
   the daemons sit at 65–85 % CPU and IRQ/softirq burns a full core (each tunnel packet is
-  three loopback packets through conntrack and the 38-rule INPUT chain; `softnet_stat`
+  three loopback packets through conntrack and the box’s large INPUT chain; `softnet_stat`
   shows `time_squeeze` on CPU0). Rust reaches that ceiling loss-free; C++ starts losing
   packets at ~5k pps under the generator's 64-packet bursts, well before it is CPU-bound —
   one packet per event-loop iteration vs the Rust loop's 64-packet drains.
@@ -244,9 +199,9 @@ What the numbers mean:
 Caveats and next steps:
 
 * Both ends on one 4-core box, on loopback, on a busy router — the absolute numbers are a
-  lower bound for the real deployment (Pi = client, VPS = server, traffic over eth0, no
-  loopback triple-processing). Measure that next: the same scripts work with the sink on
-  the VPS.
+  lower bound for a real two-box deployment (a Pi client and a remote server, traffic over a
+  real NIC, no loopback triple-processing). Measure that next: the same scripts work with the
+  sink on the remote box.
 * `tools/bench/run_fixed_pi.sh` (prepared, not yet run) offers a fixed 7k pps with 8-packet
   bursts and reports **user vs system CPU per daemon**, which isolates the daemons' own
   cost from kernel work and settles the burst-sensitivity question. Run it next, then the
@@ -323,8 +278,8 @@ Same loopback setup, driven by `tools/bench/run_quick_pi.sh` (sets `rmem_max`/`w
 and the governor for the run, restores them, prints a health check); raw log
 `docs/bench/pi4-chacha-2026-08-27.txt`. Generator `udpbench2` (sendmmsg, 64-packet
 bursts), 5 search steps of 2 s. Rust = this repo at `3c380ad` (`udp2raw-head`: table AES,
-batched I/O); "old" = the running production binary `60a36d6` (per-packet syscalls) as a
-same-session control; C++ = production `fb13730`. Deployed mode = faketcp + aes128cbc +
+batched I/O); "old" = a prior build `60a36d6` (per-packet syscalls) as a same-session
+control; C++ = stock `fb13730`. Deployed mode = faketcp + aes128cbc +
 md5 + `--fix-gro`; chacha = the same with `--cipher-mode chacha20poly1305`.
 
 | case | no-drop pps | Mbit/s | server / client CPU | vs C++ |
@@ -455,7 +410,7 @@ lose to the plain calls — measure on the target CPU, not on a stand-in.
 
 ## Raspberry Pi 5 (2026-08-28): the same box, hardware AES + mmsg
 
-`test-site-1` was swapped from a Pi 4 to a **Raspberry Pi 5 Model B** (Cortex-A76 x4 @2.4 GHz,
+Test-site-1 was swapped from a Pi 4 to a **Raspberry Pi 5 Model B** (Cortex-A76 x4 @2.4 GHz,
 ARMv8.2 with hardware AES/SHA and LSE atomics/hardware PAN), same SD card, Ubuntu 24.04,
 kernel 6.8.0-1062-raspi. The unchanged binary now auto-detects the *other* code paths:
 `syscalls: mmsg (cpu has LSE atomics ...)` and `aes backend: hardware`. Same loopback setup as

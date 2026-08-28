@@ -114,7 +114,7 @@ throughout).
 **30–60 second TTL**. Keep it a plain A record (no CDN/proxy in front — the tunnel must reach
 the relay's real address), and change the single address to rotate.
 
-**Test-site-2 and Test-site-1** (mainland client, AliDNS resolvers, `eth0` as the native underlay):
+**Example** (a mainland client, AliDNS resolvers, `eth0` as the native underlay):
 
 ```sh
 sudo ./udp2raw -c -l 127.0.0.1:7000 -r relay.example.com:8443 -k "passwd"     --raw-mode faketcp -a --fix-gro     --dns-server 223.5.5.5:53     --dns-server 223.6.6.6:53     --underlay-dev eth0
@@ -123,7 +123,7 @@ sudo ./udp2raw -c -l 127.0.0.1:7000 -r relay.example.com:8443 -k "passwd"     --
 The `223.5.5.5` / `223.6.6.6` queries and the tunnel both leave through `eth0`, and the
 client installs a `/32` route for each resolved relay address over `eth0` — so a newly
 resolved address works even though the box keeps no `/32` escape route for it in advance
-(the `test-site-1_direct` policy table's default via the LAN gateway still applies, but the
+(a direct-routing policy table's default via the LAN gateway still applies, but the
 explicit `/32` guarantees it regardless of what the default route is doing).
 
 **Rotation workflow (zero-touch cutover):**
