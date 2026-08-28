@@ -4,6 +4,7 @@ pub mod addr;
 pub mod bpf;
 pub mod lower_level;
 pub mod raw;
+pub mod route;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
