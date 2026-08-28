@@ -11,12 +11,41 @@
 # server bound to that address (-l 10.99.1.X:4096, so a server answers only its own address);
 # "down_addr X" stops that server, "up_addr X" starts it. Nothing in "cli" reaches a relay
 # unless a /32 via 10.99.0.2 on veth0 exists, so the client has to install the route itself.
-set -uo pipefail
-cd /work
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/work/target-linux}
-RUST=$CARGO_TARGET_DIR/release/udp2raw
-[ -x "$RUST" ] || cargo build --release 2>&1 | tail -1
-LOGDIR=${LOGDIR:-$CARGO_TARGET_DIR/dns-test-logs}; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
+set -euo pipefail
+WORKDIR=${DNS_RERESOLVE_WORKDIR:-/work}
+cd "$WORKDIR"
+
+# The usual target directory is a named volume and can contain an executable from another
+# checkout. Build this run in a newly-created empty directory, and never name the shared
+# release artifact as the test binary. A failed Cargo invocation therefore has no stale
+# executable that the namespace suite could accidentally run.
+SHARED_TARGET_DIR=${CARGO_TARGET_DIR:-/work/target-linux}
+BUILD_PARENT=$SHARED_TARGET_DIR/dns-reresolve-fresh-builds
+mkdir -p "$BUILD_PARENT"
+FRESH_TARGET_DIR=$(mktemp -d "$BUILD_PARENT/run.XXXXXXXX")
+cleanup_build() {
+    case ${FRESH_TARGET_DIR:-} in
+        "$BUILD_PARENT"/run.*) rm -rf -- "$FRESH_TARGET_DIR" ;;
+    esac
+}
+trap cleanup_build EXIT
+export CARGO_TARGET_DIR=$FRESH_TARGET_DIR
+RUST=$FRESH_TARGET_DIR/release/udp2raw
+BUILD_LOG=$FRESH_TARGET_DIR/cargo-build.log
+CARGO_BIN=${CARGO_BIN:-cargo}
+echo "== fresh release build ($FRESH_TARGET_DIR)"
+if ! "$CARGO_BIN" build --release > "$BUILD_LOG" 2>&1; then
+    echo "cargo build failed; namespace setup was not started" >&2
+    tail -40 "$BUILD_LOG" >&2 || true
+    exit 1
+fi
+if [ ! -x "$RUST" ]; then
+    echo "cargo reported success but fresh binary is missing: $RUST" >&2
+    exit 1
+fi
+tail -1 "$BUILD_LOG" || true
+
+LOGDIR=${LOGDIR:-$SHARED_TARGET_DIR/dns-test-logs}; rm -rf "$LOGDIR"; mkdir -p "$LOGDIR"
 ANS=$LOGDIR/answers.txt; FIFO=$LOGDIR/fifo; CACHE=$LOGDIR/endpoint.cache; CLOG=$LOGDIR/client.log
 C="ip netns exec cli"; P="ip netns exec peer"
 PASS=0; FAIL=0; pids=(); CPID=""; declare -A SRV
@@ -25,10 +54,12 @@ bad() { FAIL=$((FAIL + 1)); echo "   FAIL $1"; }
 expect() { if "${@:2}" > /dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 expect_not() { if "${@:2}" > /dev/null 2>&1; then bad "$1"; else ok "$1"; fi; }
 cleanup() {
+    set +e
     [ -n "$CPID" ] && kill "$CPID" 2>/dev/null
     for p in "${SRV[@]:-}" "${pids[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     sleep 0.5
     ip netns del cli 2>/dev/null; ip netns del peer 2>/dev/null
+    cleanup_build
 }
 trap cleanup EXIT
 up_addr() { # X : start a server bound to 10.99.1.X (idempotent)
@@ -44,7 +75,7 @@ down_addr() { # X : stop the server for 10.99.1.X
     sleep 0.3
 }
 wait_log() { local f=${3:-$CLOG}; for _ in $(seq 1 $(($2 * 10))); do grep -q -- "$1" "$f" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
-wait_ready() { for _ in $(seq 1 $(($2 * 10))); do [ "$(grep -c 'client_handshake2 to client_ready' $CLOG)" -ge "$1" ] && return 0; sleep 0.1; done; return 1; }
+wait_ready() { for _ in $(seq 1 $(($2 * 10))); do [ "$(grep -c 'client_handshake2 to client_ready' "$CLOG")" -ge "$1" ] && return 0; sleep 0.1; done; return 1; }
 # Liveness probe: datagrams must round-trip through the tunnel. Retried for a few seconds
 # because the data plane can take a moment to settle right after a (re)connect.
 probe() {
