@@ -123,7 +123,27 @@ pair in a network namespace (also C++ interop across it).
 * The fifo only supports `reconnect` (same as the C++).
 * Logging goes to stdout with the C++ format; `--log-position` prints file:line.
 
-## Deployment (Pi 4 client, 2026-08-28)
+## Deployment (test-site-1 client, 2026-08-28)
+
+**Current production: `1128cd5` (merged `main`, PR #1) with a DNS hostname endpoint.**
+The unit runs `/opt/udp2raw-rust-1128cd5-arm64 --conf-file /etc/udp2raw/test-site-1.conf
+--threads 2`; the conf's `-r` is now `relay.example.com:8443` with
+`--dns-server 223.5.5.5:53 --dns-server 223.6.6.6:53 --underlay-dev eth0` (AliDNS, reached
+directly over eth0; `relay.example.com` A = `203.0.113.10`, the VPS). On the Pi 5 `auto` gives
+`syscalls: mmsg` + `aes backend: hardware`. Deployed 2026-08-28 after: `--unit-test`, then a
+smoke run of the exact hostname conf as a second client (spare `-l` port) against the real
+VPS that resolved via eth0, installed the `/32` (proto 235), reached `client_ready` in ~1 s
+and cleaned up; then a cutover script with automatic rollback (wg1 re-handshaked, `ping
+10.66.0.1` 0 % loss). The old binary `0e0b3fa`, the literal-`-r` conf backup
+(`/root/bench/test-site-1.conf.bak-literal-*`) and the unit backup
+(`/root/bench/udp2raw-test-site-1.service.bak-0e0b3fa`) are kept for rollback. The unit's
+`ExecStartPre` still installs a static `/32` for `203.0.113.10` (metric 10) — harmless: the
+daemon installs its own metric-5 proto-235 `/32`, and if the DNS record ever moves the
+feature re-resolves and re-routes while the stale static `/32` is just an unused route.
+Rollback = restore the two backups, `daemon-reload`, `restart`.
+
+### Earlier: literal-endpoint deployment (Pi 4, `0e0b3fa`, 2026-08-28 01:28)
+
 
 Convention: hash-named binaries in `/opt` (`udp2raw-rust-<short hash>-arm64`, built by
 `cargo build --release` in the arm64 dev container from a clean checkout), the systemd unit
