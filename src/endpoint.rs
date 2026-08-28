@@ -1756,4 +1756,718 @@ mod tests {
         assert!(b.ready(0));
         assert_eq!(b.failures(), 0);
     }
+
+    fn test_paths(label: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("udp2raw-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (dir.clone(), dir.join("cache"))
+    }
+
+    #[test]
+    fn live_runtime_health_does_not_age_out_and_attended_failure_returns_promptly() {
+        let (dir, cache) = test_paths("live-health");
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.max_age_ms = 1_000;
+        let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 3600);
+        let mut c = EndpointController::bootstrap(host(), m, o, 0).unwrap();
+        c.on_authenticated_at(100);
+
+        let after_25_hours = 25 * 60 * 60 * 1_000;
+        c.on_authenticated_activity(after_25_hours, false);
+        c.request_refresh("attended test");
+        let cutover = c.on_cycle_at(after_25_hours, CycleReason::Forced, unix_now_secs()).unwrap();
+        assert_eq!(cutover.to.ip(), IpAddr::V4(ip("47.243.2.2")));
+        let rollback = c.on_cycle_at(after_25_hours + 5_000, CycleReason::AttemptFailed, unix_now_secs()).unwrap();
+        assert_eq!(rollback.to.ip(), IpAddr::V4(ip("47.243.1.1")));
+        assert_eq!(load_cache(&cache, "relay.example.com", 8443).unwrap(), Some(ip("47.243.1.1")));
+        assert!(!fallback_state_path(&cache).exists(), "attended return is not a blind old-IP probe and consumes no budget");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unsafe_budget_state_disables_blind_probes_but_not_direct_attended_rollback() {
+        let (dir, cache) = test_paths("unsafe-budget-direct-rollback");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let state = fallback_state_path(&cache);
+        crate::secure_file::atomic_write_owner_only(&state, b"not a fallback-state document\n").unwrap();
+
+        let resolver = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 3600);
+        let mut c = EndpointController::bootstrap(host(), resolver, fallback_opts(cache.clone()), 0).unwrap();
+        c.on_authenticated_at(100);
+        c.on_authenticated_activity(1_000, false);
+        c.request_refresh("attended test with fail-closed budget");
+        assert_eq!(c.on_cycle_at(1_000, CycleReason::Forced, unix_now_secs()).unwrap().to.ip(), IpAddr::V4(ip("47.243.2.2")));
+        assert_eq!(
+            c.on_cycle_at(2_000, CycleReason::AttemptFailed, unix_now_secs()).unwrap().to.ip(),
+            IpAddr::V4(ip("47.243.1.1")),
+            "a direct return to the endpoint interrupted by the operator is not a blind probe"
+        );
+
+        let mut blind = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600), fallback_opts(cache.clone()), 0).unwrap();
+        assert!(blind.on_cycle_at(10_000, CycleReason::AttemptFailed, unix_now_secs()).is_none());
+        assert_eq!(blind.current().ip(), IpAddr::V4(ip("47.243.2.2")));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn routine_refresh_never_schedules_a_destructive_probe() {
+        let (dir, cache) = test_paths("no-periodic-probe");
+        let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 10);
+        let mut c = EndpointController::bootstrap(host(), m, fallback_opts(cache), 0).unwrap();
+        c.on_authenticated_at(100);
+        for now in [60_000, 86_400_000, 7 * 86_400_000] {
+            c.on_authenticated_activity(now, false);
+            assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+            assert!(!c.probation_rollback_due(now));
+        }
+        assert_eq!(c.queries(), 1, "healthy Ready operation never enters the reconnect-only resolver path");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolver_elapsed_time_cancels_an_expired_attended_round() {
+        let (dir, cache) = test_paths("resolver-elapsed-round");
+        let resolver = Mock::new(
+            vec![
+                Ok(vec![ip("47.243.1.1")]),
+                Ok(vec![ip("47.243.2.2")]),
+            ],
+            3600,
+        );
+        let mut c = EndpointController::bootstrap(host(), resolver, fallback_opts(cache), 0).unwrap();
+        c.on_authenticated_at(100);
+        c.on_authenticated_activity(1_000, false);
+        c.request_refresh("attended test whose DNS consumes the round");
+        assert!(c
+            .on_cycle_after_query_at(1_000, 11_000, CycleReason::Forced, unix_now_secs())
+            .is_none());
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn attended_cutover_requires_enough_actual_rollback_horizon() {
+        let (dir, cache) = test_paths("cutover-horizon");
+        let resolver = Mock::new(
+            vec![
+                Ok(vec![ip("47.243.1.1")]),
+                Ok(vec![ip("47.243.2.2")]),
+            ],
+            3600,
+        );
+        let mut c = EndpointController::bootstrap(host(), resolver, fallback_opts(cache), 0).unwrap();
+        c.on_authenticated_at(0);
+        c.request_refresh("late attended test");
+        assert!(c
+            .on_cycle_at(5_000, CycleReason::Forced, unix_now_secs())
+            .is_none());
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handshake_and_heartbeats_do_not_destroy_rollback_point() {
+        let (dir, cache) = test_paths("probation-blackhole");
+        let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 3600);
+        let mut c = EndpointController::bootstrap(host(), m, fallback_opts(cache.clone()), 0).unwrap();
+        c.on_authenticated_at(100);
+        c.on_authenticated_activity(1_000, false);
+        c.request_refresh("attended test");
+        c.on_cycle_at(1_000, CycleReason::Forced, unix_now_secs()).unwrap();
+        c.on_authenticated_at(2_000);
+        assert!(c.is_probationary());
+        assert_eq!(c.retained_addresses(), vec![ip("47.243.2.2"), ip("47.243.1.1")]);
+        for now in [3_000, 8_000, 15_000] {
+            c.on_authenticated_activity(now, false);
+        }
+        assert!(matches!(c.promote_candidate(ip("47.243.2.2"), 15_000), PromotionResult::InsufficientEvidence { .. }));
+        assert_eq!(load_cache(&cache, "relay.example.com", 8443).unwrap(), Some(ip("47.243.1.1")));
+        assert!(c.probation_rollback_due(20_200));
+        assert!(
+            !fallback_state_path(&cache).exists(),
+            "an attended return to the endpoint that was just healthy is not a blind old-IP probe"
+        );
+        c.on_session_ended();
+        let sw = c
+            .on_cycle_at(21_400, CycleReason::ProbationExpired, unix_now_secs())
+            .unwrap();
+        assert_eq!(sw.to.ip(), IpAddr::V4(ip("47.243.1.1")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_cache_cannot_extend_probation_past_the_rollback_window() {
+        let (dir, cache) = test_paths("cache-probation-cap");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let wall = unix_now_secs();
+        let mut c = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600), fallback_opts(cache), 0).unwrap();
+        c.on_authenticated_at(100);
+        assert!(c.is_probationary());
+        assert!(!c.probation_rollback_due_at(19_299, wall));
+        assert!(c.probation_rollback_due_at(19_300, wall));
+        let state = load_fallback_state(
+            c.fallback_state_path.as_deref().unwrap(),
+            "relay.example.com",
+            8443,
+            3,
+            false,
+            wall,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.global_tokens, 2);
+        assert_eq!(state.entries[0].charged, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn insufficient_freshness_never_schedules_rollback_before_probation_can_finish() {
+        let (dir, cache) = test_paths("short-probation-horizon");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut options = fallback_opts(cache.clone());
+        // Two timer ticks fit, but the configured probation plus those ticks does not.
+        options.last_good_fallback.rollback_window_ms = 2_500;
+        let mut c = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600),
+            options,
+            0,
+        )
+        .unwrap();
+
+        c.on_authenticated_at(100);
+        assert!(c.is_probationary());
+        for now in [1_100, 2_100, 2_600, 20_000] {
+            c.on_authenticated_activity(now, true);
+            assert!(!c.probation_rollback_due(now));
+            assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.2.2")));
+        }
+        assert_eq!(
+            load_cache(&cache, "relay.example.com", 8443).unwrap(),
+            Some(ip("47.243.1.1"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expired_startup_cache_never_interrupts_a_healthy_probationary_candidate() {
+        let (dir, cache) = test_paths("stale-cache-no-loop");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.max_age_ms = 1_000;
+        let mut c = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600),
+            o,
+            0,
+        )
+        .unwrap();
+        c.on_authenticated_at(2_000);
+        assert!(c.is_probationary());
+        for now in [2_000, 20_000, 86_400_000] {
+            c.on_authenticated_activity(now, false);
+            assert!(!c.probation_rollback_due(now));
+            assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.2.2")));
+        }
+        assert_eq!(
+            load_cache(&cache, "relay.example.com", 8443).unwrap(),
+            Some(ip("47.243.1.1"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promotion_requires_endpoint_qualified_fifo_authority_and_sustained_data() {
+        let (dir, cache) = test_paths("promotion-evidence");
+        let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 3600);
+        let mut c = EndpointController::bootstrap(host(), m, fallback_opts(cache.clone()), 0).unwrap();
+        c.on_authenticated_at(100);
+        c.on_authenticated_activity(1_000, false);
+        c.request_refresh("attended test");
+        c.on_cycle_at(1_000, CycleReason::Forced, unix_now_secs()).unwrap();
+        c.on_authenticated_at(2_000);
+        assert_eq!(c.promote_candidate(ip("47.243.9.9"), 2_000), PromotionResult::WrongCandidate);
+        for now in [2_100, 3_100, 4_100] {
+            c.on_authenticated_activity(now, true);
+        }
+        assert_eq!(c.promote_candidate(ip("47.243.2.2"), 4_100), PromotionResult::Promoted { previous: ip("47.243.1.1") });
+        assert_eq!(load_cache(&cache, "relay.example.com", 8443).unwrap(), Some(ip("47.243.2.2")));
+        assert_eq!(c.retained_addresses(), vec![ip("47.243.2.2")]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promotion_rejects_stale_expired_or_disconnected_evidence() {
+        let (dir, cache) = test_paths("promotion-runtime-gates");
+        let resolver = Mock::new(
+            vec![
+                Ok(vec![ip("47.243.1.1")]),
+                Ok(vec![ip("47.243.2.2")]),
+            ],
+            3600,
+        );
+        let mut c = EndpointController::bootstrap(host(), resolver, fallback_opts(cache), 0).unwrap();
+        c.on_authenticated_at(100);
+        c.on_authenticated_activity(1_000, false);
+        c.request_refresh("attended test");
+        c.on_cycle_at(1_000, CycleReason::Forced, unix_now_secs())
+            .unwrap();
+        c.on_authenticated_at(2_000);
+        for now in [2_100, 3_100, 4_100] {
+            c.on_authenticated_activity(now, true);
+        }
+        assert_eq!(
+            c.promote_candidate(ip("47.243.2.2"), 7_000),
+            PromotionResult::StaleEvidence { idle_ms: 2_900 }
+        );
+        assert_eq!(
+            c.promote_candidate(ip("47.243.2.2"), 20_200),
+            PromotionResult::RollbackExpired
+        );
+        c.on_session_ended();
+        assert_eq!(
+            c.promote_candidate(ip("47.243.2.2"), 20_200),
+            PromotionResult::NotActive
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn first_install_with_absent_state_directory_can_precharge_in_same_process() {
+        let (dir, _) = test_paths("first-install-state");
+        let cache = dir.join("new-state-directory").join("cache");
+        assert!(!cache.parent().unwrap().exists());
+        let mut options = fallback_opts(cache.clone());
+        options.last_good_fallback.after_failures = 1;
+        let wall = unix_now_secs();
+        let resolver = Mock::new(
+            vec![
+                Ok(vec![ip("47.243.1.1")]),
+                Ok(vec![ip("47.243.2.2")]),
+            ],
+            3600,
+        );
+        let mut c = EndpointController::bootstrap(host(), resolver, options, 0).unwrap();
+        assert!(cache.parent().unwrap().is_dir());
+        c.on_authenticated_at(100);
+        c.on_authenticated_activity(500, false);
+
+        c.request_refresh("failed replacement");
+        assert_eq!(
+            c.on_cycle_at(1_000, CycleReason::SessionLost, wall)
+                .unwrap()
+                .to
+                .ip(),
+            IpAddr::V4(ip("47.243.2.2"))
+        );
+        assert_eq!(
+            c.on_cycle_at(2_000, CycleReason::AttemptFailed, wall)
+                .unwrap()
+                .to
+                .ip(),
+            IpAddr::V4(ip("47.243.1.1"))
+        );
+
+        let state = load_fallback_state(
+            &fallback_state_path(&cache),
+            "relay.example.com",
+            8443,
+            3,
+            false,
+            wall,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.global_tokens, 2);
+        assert_eq!(state.entries[0].charged, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn precharged_budget_survives_crash_and_restarts_for_unchanged_dns() {
+        let (dir, cache) = test_paths("restart-budget");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.after_failures = 1;
+        let wall = unix_now_secs();
+
+        let mut first = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600), o.clone(), 0).unwrap();
+        assert_eq!(first.on_cycle_at(5_000, CycleReason::AttemptFailed, wall).unwrap().to.ip(), IpAddr::V4(ip("47.243.1.1")));
+        drop(first); // crash before the old endpoint can report success or failure
+
+        let mut immediate = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600), o.clone(), 0).unwrap();
+        assert!(immediate.on_cycle_at(5_000, CycleReason::AttemptFailed, wall).is_none(), "restart cannot refund cooldown or charge");
+
+        let mut second = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600), o.clone(), 0).unwrap();
+        assert!(second.on_cycle_at(5_000, CycleReason::AttemptFailed, wall + 2).is_some());
+        drop(second);
+        let mut exhausted = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600), o, 0).unwrap();
+        assert!(exhausted.on_cycle_at(5_000, CycleReason::AttemptFailed, wall + 4).is_none());
+        let state = load_fallback_state(
+            &fallback_state_path(&cache),
+            "relay.example.com",
+            8443,
+            3,
+            false,
+            wall + 4,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.entries[0].charged, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keyed_probation_failures_across_restarts_and_dns_churn_consume_global_budget() {
+        let (dir, cache) = test_paths("keyed-probation-budget");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut options = fallback_opts(cache.clone());
+        options.last_good_fallback.max_attempts = 10;
+        options.last_good_fallback.global_capacity = 2;
+        options.last_good_fallback.global_refill_ms = 3_600_000;
+        let wall = unix_now_secs();
+
+        for (offset, candidate) in ["47.243.2.2", "47.243.3.3"].into_iter().enumerate() {
+            let mut c = EndpointController::bootstrap(
+                host(),
+                Mock::new(vec![Ok(vec![ip(candidate)])], 3600),
+                options.clone(),
+                0,
+            )
+            .unwrap();
+            c.on_authenticated_at(100);
+            assert!(c.is_probationary());
+            assert_eq!(
+                c.on_cycle_at(
+                    1_000,
+                    CycleReason::AttemptFailed,
+                    wall + offset as u64,
+                )
+                .unwrap()
+                .to
+                .ip(),
+                IpAddr::V4(ip("47.243.1.1"))
+            );
+            // Model a crash before the old-address probe can report an outcome.
+        }
+
+        let mut denied = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.4.4")])], 3600),
+            options,
+            0,
+        )
+        .unwrap();
+        denied.on_authenticated_at(100);
+        assert!(denied.is_probationary());
+        assert!(
+            !denied.probation_rollback_due_at(19_300, wall + 2),
+            "an exhausted bucket must keep a live keyed candidate instead of probing old"
+        );
+        assert_eq!(denied.current().ip(), IpAddr::V4(ip("47.243.4.4")));
+        assert!(denied.current_authenticated());
+
+        let state = load_fallback_state(
+            &fallback_state_path(&cache),
+            "relay.example.com",
+            8443,
+            2,
+            false,
+            wall + 2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.global_tokens, 0);
+        assert_eq!(state.entries.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dns_set_churn_cannot_bypass_global_probe_bucket() {
+        let (dir, cache) = test_paths("global-budget");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.after_failures = 1;
+        o.last_good_fallback.max_attempts = 10;
+        o.last_good_fallback.global_capacity = 2;
+        o.last_good_fallback.global_refill_ms = 3_600_000;
+        let wall = unix_now_secs();
+        for (idx, bad) in ["47.243.2.2", "47.243.3.3"].into_iter().enumerate() {
+            let mut c = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip(bad)])], 3600), o.clone(), 0).unwrap();
+            assert!(c.on_cycle_at(5_000, CycleReason::AttemptFailed, wall + (idx as u64) * 2).is_some());
+        }
+        let mut denied = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.4.4")])], 3600), o, 0).unwrap();
+        assert!(denied.on_cycle_at(5_000, CycleReason::AttemptFailed, wall + 4).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_controller_snapshots_cannot_lose_precharges() {
+        let (dir, cache) = test_paths("locked-precharge");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.after_failures = 1;
+        o.last_good_fallback.max_attempts = 10;
+        o.last_good_fallback.global_capacity = 2;
+        o.last_good_fallback.global_refill_ms = 3_600_000;
+        let wall = unix_now_secs();
+
+        // Both controllers take their startup snapshot before either consumes a token.
+        let mut first = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600),
+            o.clone(),
+            0,
+        )
+        .unwrap();
+        let mut second = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.3.3")])], 3600),
+            o,
+            0,
+        )
+        .unwrap();
+        assert!(first
+            .on_cycle_at(5_000, CycleReason::AttemptFailed, wall)
+            .is_some());
+        assert!(second
+            .on_cycle_at(5_000, CycleReason::AttemptFailed, wall)
+            .is_some());
+
+        let state = load_fallback_state(
+            &fallback_state_path(&cache),
+            "relay.example.com",
+            8443,
+            2,
+            false,
+            wall,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.global_tokens, 0);
+        assert_eq!(state.entries.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dns_churn_cannot_evict_and_refund_a_full_per_set_table() {
+        let (dir, cache) = test_paths("budget-table-full");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.after_failures = 1;
+        o.last_good_fallback.max_attempts = 1;
+        o.last_good_fallback.global_capacity = 100;
+        o.last_good_fallback.global_refill_ms = 3_600_000;
+        let wall = unix_now_secs();
+
+        for last in 2..=17 {
+            let mut c = EndpointController::bootstrap(
+                host(),
+                Mock::new(vec![Ok(vec![Ipv4Addr::new(47, 243, 2, last)])], 3600),
+                o.clone(),
+                0,
+            )
+            .unwrap();
+            assert!(c
+                .on_cycle_at(5_000, CycleReason::AttemptFailed, wall)
+                .is_some());
+        }
+        let mut overflow = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.2.18")])], 3600),
+            o.clone(),
+            0,
+        )
+        .unwrap();
+        assert!(overflow
+            .on_cycle_at(5_000, CycleReason::AttemptFailed, wall)
+            .is_none());
+
+        let mut original = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(vec![ip("47.243.2.2")])], 3600),
+            o,
+            0,
+        )
+        .unwrap();
+        assert!(original
+            .on_cycle_at(5_000, CycleReason::AttemptFailed, wall + 2)
+            .is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saturated_refill_backlog_cannot_be_replayed_by_restarts() {
+        let (dir, cache) = test_paths("global-refill-backlog");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache.clone());
+        o.last_good_fallback.after_failures = 1;
+        o.last_good_fallback.max_attempts = 10;
+        o.last_good_fallback.global_capacity = 2;
+        o.last_good_fallback.global_refill_ms = 1_000;
+        let far_future = unix_now_secs().saturating_add(200);
+
+        for bad in ["47.243.2.2", "47.243.3.3"] {
+            let mut c = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip(bad)])], 3600), o.clone(), 0).unwrap();
+            assert!(c.on_cycle_at(5_000, CycleReason::AttemptFailed, far_future).is_some());
+        }
+
+        let mut denied = EndpointController::bootstrap(host(), Mock::new(vec![Ok(vec![ip("47.243.4.4")])], 3600), o, 0).unwrap();
+        assert!(denied.on_cycle_at(5_000, CycleReason::AttemptFailed, far_future).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_answer_is_capped_and_round_deadline_bounds_recovery() {
+        let (dir, cache) = test_paths("candidate-cap");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let mut o = fallback_opts(cache);
+        o.last_good_fallback.after_failures = 100;
+        o.last_good_fallback.preferred_round_timeout_ms = 10_000;
+        let answers = (10..40).rev().map(|last| Ipv4Addr::new(47, 243, 2, last)).collect();
+        let mut c = EndpointController::bootstrap(host(), Mock::new(vec![Ok(answers)], 3600), o, 0).unwrap();
+        assert_eq!(c.candidates().len(), MAX_ENDPOINT_CANDIDATES);
+        assert_eq!(c.canonical_candidates()[0], ip("47.243.2.10"));
+        assert_ne!(c.on_cycle_at(9_000, CycleReason::AttemptFailed, unix_now_secs()).unwrap().to.ip(), IpAddr::V4(ip("47.243.1.1")));
+        let recovered = c.on_cycle_at(10_000, CycleReason::AttemptFailed, unix_now_secs()).unwrap();
+        assert_eq!(recovered.to.ip(), IpAddr::V4(ip("47.243.1.1")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expired_round_does_not_start_another_handshake_from_committed_current() {
+        let (dir, cache) = test_paths("committed-round-deadline");
+        let answer = vec![ip("47.243.1.1"), ip("47.243.2.2")];
+        let mut c = EndpointController::bootstrap(
+            host(),
+            Mock::new(vec![Ok(answer.clone()), Ok(answer.clone()), Ok(answer)], 10),
+            fallback_opts(cache),
+            0,
+        )
+        .unwrap();
+        c.on_authenticated_at(100);
+
+        // TTL expiry starts a preferred round, but continuity keeps the committed address
+        // for this reconnect attempt.
+        assert!(c
+            .on_cycle_at(10_000, CycleReason::SessionLost, unix_now_secs())
+            .is_none());
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+
+        // Its handshake finishes at the absolute round deadline. Do not append a second
+        // candidate handshake to that expired round.
+        assert!(c
+            .on_cycle_at(20_000, CycleReason::AttemptFailed, unix_now_secs())
+            .is_none());
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+
+        // A later cycle may start a new, independently bounded round.
+        assert_eq!(
+            c.on_cycle_at(20_001, CycleReason::AttemptFailed, unix_now_secs())
+                .unwrap()
+                .to
+                .ip(),
+            IpAddr::V4(ip("47.243.2.2"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_parser_rejects_unsafe_content_and_addresses() {
+        let (dir, cache) = test_paths("cache-input");
+        let invalid_documents = [
+            "host=relay.example.com\nport=8443\naddr=47.243.1.1\ntrailing=x\n",
+            "host=relay.example.com\nhost=relay.example.com\nport=8443\naddr=47.243.1.1\n",
+            "host=relay.example.com\nport=8443\naddr=47.243.1.1\nsaved=nope\n",
+            "host=other.example.com\nport=8443\naddr=47.243.1.1\n",
+            "host=relay.example.com\nport=1\naddr=47.243.1.1\n",
+        ];
+        for (idx, body) in invalid_documents.into_iter().enumerate() {
+            crate::secure_file::atomic_write_owner_only(&cache, body.as_bytes()).unwrap();
+            let result = load_cache_entry(&cache, "relay.example.com", 8443, false);
+            if idx < 3 {
+                assert!(result.is_err(), "{body:?}");
+            } else {
+                assert_eq!(result.unwrap(), None, "{body:?}");
+            }
+        }
+        for bad in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "192.0.0.8",
+            "192.0.0.170",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+        ] {
+            let body = format!("host=relay.example.com\nport=8443\naddr={bad}\n");
+            crate::secure_file::atomic_write_owner_only(&cache, body.as_bytes()).unwrap();
+            assert!(load_cache_entry(&cache, "relay.example.com", 8443, false).is_err(), "{bad}");
+        }
+        crate::secure_file::atomic_write_owner_only(&cache, &vec![b'x'; CACHE_MAX_BYTES + 1]).unwrap();
+        assert!(load_cache_entry(&cache, "relay.example.com", 8443, false).is_err());
+        for (host, port, addr) in [
+            ("Relay.Example.com", 8443, ip("47.243.1.1")),
+            ("relay.example.com", 0, ip("47.243.1.1")),
+            ("relay.example.com", 8443, ip("127.0.0.1")),
+            ("relay.example.com", 8443, ip("10.0.0.1")),
+        ] {
+            assert!(save_cache(&cache, host, port, addr).is_err());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fallback_state_parser_rejects_noncanonical_or_implausible_documents() {
+        let (dir, cache) = test_paths("state-input");
+        fresh_cache(&cache, ip("47.243.1.1"));
+        let state_path = fallback_state_path(&cache);
+        let wall = unix_now_secs();
+        let valid_prefix = format!(
+            "# udp2raw fallback state v1\nversion=1\nhost=relay.example.com\nport=8443\nglobal_tokens=2\nglobal_updated={wall}\n"
+        );
+        let invalid = [
+            valid_prefix.replace("global_tokens=2", "global_tokens=02"),
+            valid_prefix.replace(
+                &format!("global_updated={wall}"),
+                &format!("global_updated={}", wall.saturating_add(301)),
+            ),
+            format!("{valid_prefix}entry=127.0.0.1|1|{wall}|{wall}|47.243.2.2\n"),
+            format!("{valid_prefix}entry=47.243.1.1|01|{wall}|{wall}|47.243.2.2\n"),
+            format!(
+                "{valid_prefix}entry=47.243.1.1|1|{}|{wall}|47.243.2.2\n",
+                wall.saturating_sub(1)
+            ),
+            format!(
+                "{valid_prefix}entry=47.243.1.1|1|{}|{}|47.243.2.2\n",
+                wall.saturating_add(MAX_PERSISTED_COOLDOWN_SECS + 1),
+                wall
+            ),
+            format!("{valid_prefix}entry=47.243.1.1|1|{wall}|{wall}|47.243.3.3,47.243.2.2\n"),
+            format!("{valid_prefix}trailing=x\n"),
+        ];
+        for body in invalid {
+            crate::secure_file::atomic_write_owner_only(&state_path, body.as_bytes()).unwrap();
+            assert!(
+                load_fallback_state(
+                    &state_path,
+                    "relay.example.com",
+                    8443,
+                    3,
+                    false,
+                    wall,
+                )
+                .is_err(),
+                "accepted {body:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
