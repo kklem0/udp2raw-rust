@@ -122,8 +122,19 @@ mod linux {
     /// Client: decide the relay address to start with (DNS, then the cache, then
     /// `--bootstrap-addr`) and keep the controller for later re-resolution.
     fn bootstrap_endpoint(cfg: &mut Config) -> Result<EndpointController, i32> {
-        let opts = EndpointOptions { allow_private: cfg.allow_private_endpoint, cache_file: cfg.endpoint_cache.clone(), bootstrap: cfg.bootstrap_addr, ..EndpointOptions::default() };
-        let dns = DnsConfig { servers: cfg.dns_servers.clone(), device: cfg.underlay_dev.clone(), timeout: Duration::from_millis(cfg.dns_timeout_ms) };
+        let opts = EndpointOptions {
+            allow_private: cfg.allow_private_endpoint,
+            cache_file: cfg.endpoint_cache.clone(),
+            bootstrap: cfg.bootstrap_addr,
+            ..EndpointOptions::default()
+        };
+        let dns = DnsConfig {
+            servers: cfg.dns_servers.clone(),
+            device: cfg.underlay_dev.clone(),
+            timeout: Duration::from_millis(cfg.dns_timeout_ms),
+            overall_timeout: Duration::from_millis(10_000),
+            allow_private: cfg.allow_private_endpoint,
+        };
         if cfg.remote.is_dynamic() {
             log::info!("endpoint: resolving {} through {:?}{} (timeout {} ms, cache {})", cfg.remote, cfg.dns_servers, cfg.underlay_dev.as_deref().map_or(String::new(), |d| format!(" via {d}")), cfg.dns_timeout_ms, cfg.endpoint_cache.as_deref().map_or("off".to_string(), |p| p.display().to_string()));
         }
