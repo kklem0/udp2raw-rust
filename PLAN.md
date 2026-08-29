@@ -20,8 +20,8 @@ how to test on the Pis. Keep the **Status** section current.
 | Server (many clients, conv sockets, connection recovery, GC) | done |
 | Ordered multithreaded crypto pipeline | done, unit-tested (ordering + roundtrip) |
 | iptables `-a/-g/--gen-add/--keep-rule/--clear/--wait-lock` | done (per-endpoint rules for a hostname `-r`) |
-| Hostname client `-r` + in-process relay switching (`--dns-server`, `--underlay-dev`, netlink `/32` routes, endpoint cache) | implemented and verified from a unique fresh Linux/arm64 release build; namespace suite **118/118 pass (pass=118, fail=0)** on 2026-08-29 |
-| Authenticated last-good rollback | smallest-safe v1 implemented, explicitly opt-in/default-off: committed-good and probationary stay distinct, blind probes are durably pre-charged, and healthy Ready sessions are never disrupted for automatic convergence; fresh Linux/arm64 namespace suite **118/118 pass (pass=118, fail=0)** on 2026-08-29 |
+| Hostname client `-r` + in-process relay switching (`--dns-server`, `--underlay-dev`, netlink `/32` routes, endpoint cache) | implemented and verified from a unique fresh Linux/arm64 release build; namespace suite **129/129 pass (pass=129, fail=0)** on 2026-08-29, including a reconnect refresh before a 3600-second TTL and easy-fakeTCP retargeting |
+| Authenticated last-good rollback | smallest-safe v1 implemented, explicitly opt-in/default-off: committed-good and probationary stay distinct, blind probes are durably pre-charged, and healthy Ready sessions are never disrupted for automatic convergence; attended failed candidates return directly without blind-probe opt-in; fresh Linux/arm64 namespace suite **129/129 pass (pass=129, fail=0)** on 2026-08-29 |
 | Docker e2e: loopback + veth/netns, all modes incl. chacha20poly1305, easy-faketcp, `--lower-level auto`, Rust↔C++ interop | **25/25 pass** (2026-08-27; veth cases need `--cap-add SYS_ADMIN`); 25/25 again with `RUST_EXTRA="--syscalls single"` (2026-08-28) |
 | Pi 4 measurements (loopback, C++ vs Rust; deployed mode vs `chacha20poly1305`; batched-I/O regression found and fixed with `--syscalls`) | **done 2026-08-27/28** — see the "Raspberry Pi 4" sections below |
 | Pi 5 measurements (same box swapped to a Pi 5; hardware AES + mmsg confirmed by auto-detection) | **done 2026-08-28** — see "Raspberry Pi 5" below; a two-box measurement still to do |
@@ -75,7 +75,8 @@ Threading model (the reason for the port):
   passed 119 library + 1 binary + 3 vector tests, `cargo check`, and strict Clippy;
   Linux/arm64 passed 146 library + 1 binary + 3 vector tests, `cargo check`, and strict
   Clippy from a unique fresh target directory.
-* `cargo test` on macOS: 42 unit tests + `tests/vectors.rs` (golden vectors) pass.
+* `cargo test --all-targets` on macOS: 121 library tests, 1 binary test and all 3
+  `tests/vectors.rs` golden-vector suites pass.
 * `cargo check --target aarch64-unknown-linux-gnu --all-targets`: clean.
 * Docker (`rust:1-bookworm`, arm64, `--cap-add NET_RAW,NET_ADMIN`): `tools/docker/e2e.sh`
   builds the C++ reference from the mounted checkout and runs client+server over
@@ -83,12 +84,13 @@ Threading model (the reason for the port):
   and C++↔Rust in both directions, probing 2,000 datagrams on 2 convs plus a throughput
   blast. Results are logged at the end of this file.
 * `tools/docker/dns_reresolve_test.sh` now contains isolated-namespace scenarios for DNS
-  rotation and resolver loss, continuous traffic during healthy fallback, attended bad
-  cutover/direct rollback, correctly keyed black-hole probation, PID/listener continuity,
-  and two clients sharing independently owned protocol-235 `/32` routes/rules. It builds in
-  a unique empty target directory and has a failure-injection check that a failed Cargo build
-  cannot run a stale artifact. **The complete suite passed 118/118 (pass=118, fail=0) on
-  Linux/arm64 from the script's unique fresh release build on 2026-08-29.**
+  rotation and resolver loss, fresh lookup on session failure before a 3600-second TTL,
+  continuous traffic during healthy fallback, attended bad cutover/direct rollback,
+  easy-fakeTCP socket retargeting, correctly keyed black-hole probation, PID/listener
+  continuity, and two clients sharing independently owned protocol-235 `/32` routes/rules.
+  It builds in a unique empty target directory and has a failure-injection check that a failed
+  Cargo build cannot run a stale artifact. **The complete suite passed 129/129 (pass=129,
+  fail=0) on Linux/arm64 from the script's unique fresh release build on 2026-08-29.**
 
 ## Hostname endpoint / fallback v1 hand-off
 
