@@ -3,9 +3,10 @@
 //!
 //! Rules (see README "Hostname endpoints"):
 //! * A literal address never resolves anything and behaves exactly as before.
-//! * A hostname is resolved through the explicit `--dns-server`s at startup and at the start
-//!   of a reconnect cycle when the cached answer's TTL has expired or a refresh was forced
-//!   (`reconnect` on the fifo). Failed queries back off exponentially with jitter.
+//! * A hostname is resolved through the explicit `--dns-server`s at startup and when an
+//!   established session enters a reconnect cycle. TTL expiry refreshes the cached answer at
+//!   the next reconnect boundary, and `reconnect` on the fifo forces a refresh. Failed queries
+//!   remain pending and back off exponentially with jitter.
 //! * An answer only produces *candidates*. The current address stays first; the rest are
 //!   sorted numerically, so a reordered answer changes nothing. A different address is used
 //!   only at a reconnect boundary: immediately when DNS no longer lists the current one, or
@@ -263,6 +264,10 @@ pub struct EndpointController {
     expires_at_ms: Option<u64>,
     backoff: Backoff,
     force_refresh: bool,
+    /// An established session failed and still needs one successful reconnect-boundary
+    /// refresh. This stays set across resolver failures so a fresh (but long-TTL) cached
+    /// answer cannot suppress retries for the rest of its TTL.
+    reconnect_refresh_pending: bool,
     queries: u64,
     /// Failed handshake cycles on DNS-preferred candidates since the last authentication.
     preferred_failures: u32,
@@ -350,6 +355,7 @@ impl EndpointController {
             expires_at_ms: None,
             backoff: Backoff::new(2_000, 60_000),
             force_refresh: false,
+            reconnect_refresh_pending: false,
             queries: 0,
             preferred_failures: 0,
             preferred_round_deadline_ms: None,
@@ -576,6 +582,10 @@ impl EndpointController {
     pub fn request_refresh(&mut self, why: &str) {
         if self.is_dynamic() {
             log::info!("endpoint: refresh requested ({why})");
+            self.attended_cutover = match self.current.ip() {
+                IpAddr::V4(cur) => self.current_authenticated && self.committed_good == Some(cur),
+                IpAddr::V6(_) => false,
+            };
             self.force_refresh = true;
             self.backoff.on_success();
         }
@@ -606,8 +616,11 @@ impl EndpointController {
         if !self.is_dynamic() {
             return None;
         }
+        if reason == CycleReason::SessionLost {
+            self.reconnect_refresh_pending = true;
+        }
         let expired = self.expires_at_ms.is_none_or(|t| now_ms >= t);
-        let due = self.force_refresh || expired || self.candidates.is_empty();
+        let due = self.force_refresh || self.reconnect_refresh_pending || expired || self.candidates.is_empty();
         let mut query_succeeded = None;
         let mut decision_now_ms = now_ms;
         let mut decision_wall_now = wall_now;
@@ -617,7 +630,11 @@ impl EndpointController {
             }
             if self.backoff.ready(now_ms) {
                 self.force_refresh = false;
-                query_succeeded = Some(self.query(now_ms));
+                let succeeded = self.query(now_ms);
+                if succeeded {
+                    self.reconnect_refresh_pending = false;
+                }
+                query_succeeded = Some(succeeded);
             } else {
                 log::debug!("endpoint: dns query deferred by backoff ({} failures)", self.backoff.failures());
             }
@@ -1018,13 +1035,18 @@ impl EndpointController {
             if self.round_expired(now_ms) {
                 log::warn!("endpoint: attended cutover cancelled because the preferred-candidate round deadline elapsed during resolution");
                 self.preferred_round_deadline_ms = None;
+                self.attended_cutover = false;
                 return None;
             }
             if query_succeeded != Some(true) || self.candidates.is_empty() {
                 log::warn!("endpoint: attended FIFO cutover got no fresh usable DNS answer; reconnecting the current endpoint without changing it");
+                self.attended_cutover = false;
                 return None;
             }
-            let target = self.canonical_candidates()[0];
+            // `order_candidates` keeps the current/committed address first when DNS still
+            // contains it. A planned reconnect must not rotate merely because another
+            // answer is numerically lower or the resolver changed wire order.
+            let target = self.candidates[0];
             if target != cur {
                 self.start_preferred_round(now_ms);
                 if self.opts.last_good_fallback.enabled && self.committed_good == Some(cur) {
@@ -1040,12 +1062,13 @@ impl EndpointController {
                         log::warn!(
                             "endpoint: attended cutover to {target} refused because committed-good {cur} cannot remain rollback-eligible through {required_through}ms"
                         );
+                        self.attended_cutover = false;
                         return None;
                     }
                 }
-                self.attended_cutover = self.opts.last_good_fallback.enabled && self.committed_good == Some(cur);
                 return self.switch_to(target, reason, format!("attended FIFO cutover to DNS-preferred {target}"));
             }
+            self.attended_cutover = false;
             return None;
         }
 
@@ -1064,7 +1087,11 @@ impl EndpointController {
                 }
             }
             if self.attended_cutover {
-                if let Some(rollback) = self.committed_fresh(now_ms, cur) {
+                // `request_refresh` records this authority only while the current endpoint
+                // is authenticated and committed. Returning to the endpoint interrupted by
+                // that same FIFO command is therefore not a blind historical-address probe
+                // and is safe even when the optional unattended fallback policy is off.
+                if let Some(rollback) = self.committed_good.filter(|rollback| *rollback != cur) {
                     self.attended_cutover = false;
                     return self.switch_to(rollback, reason, format!("attended candidate {cur} failed; returning directly to preserved {rollback}"));
                 }
@@ -1626,27 +1653,36 @@ mod tests {
 
     #[test]
     fn failed_attempt_switches_to_new_dns_address_and_dns_failure_keeps_current() {
-        let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")]), Err("timeout")], 30);
+        let m = Mock::new(
+            vec![
+                Ok(vec![ip("47.243.1.1")]),
+                Err("timeout"),
+                Err("servfail"),
+                Ok(vec![ip("47.243.2.2")]),
+            ],
+            3600,
+        );
         let mut c = EndpointController::bootstrap(host(), m, opts(), 0).unwrap();
         c.on_authenticated_at(1_000);
-        // session lost while the TTL is fresh: no query, no switch
+        // A real session loss forces a query even though the cached answer has an hour left.
+        // Failure retains the current/last-good address and leaves the refresh pending.
         assert!(c.on_cycle(5_000, CycleReason::SessionLost).is_none());
-        assert_eq!(c.queries(), 1);
-        // TTL expired, DNS still says the same: no switch even after a failed attempt (single candidate)
-        assert!(c.on_cycle(31_000, CycleReason::AttemptFailed).is_none());
         assert_eq!(c.queries(), 2);
-        // next expiry: DNS moved -> switch immediately, not yet last-known-good
-        let sw = c.on_cycle(62_000, CycleReason::AttemptFailed).unwrap();
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.1.1")));
+        assert_eq!(c.last_good(), Some(ip("47.243.1.1")));
+
+        // Backoff prevents an immediate query storm, then retries independently of TTL.
+        assert!(c.on_cycle(6_000, CycleReason::AttemptFailed).is_none());
+        assert_eq!(c.queries(), 2);
+        assert!(c.on_cycle(8_000, CycleReason::AttemptFailed).is_none());
+        assert_eq!(c.queries(), 3);
+        let sw = c.on_cycle(13_000, CycleReason::AttemptFailed).unwrap();
         assert_eq!(sw.from.ip(), IpAddr::V4(ip("47.243.1.1")));
         assert_eq!(sw.to.ip(), IpAddr::V4(ip("47.243.2.2")));
         assert_eq!(c.last_good(), Some(ip("47.243.1.1")));
         assert!(!c.current_authenticated());
-        // resolver dies: current stays, last-good untouched
-        assert!(c.on_cycle(100_000, CycleReason::AttemptFailed).is_none());
-        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.2.2")));
-        assert_eq!(c.last_good(), Some(ip("47.243.1.1")));
         // handshake succeeds on the new one: it becomes last-known-good and the old one is released
-        assert_eq!(c.on_authenticated_at(101_000), Some(ip("47.243.1.1")));
+        assert_eq!(c.on_authenticated_at(14_000), Some(ip("47.243.1.1")));
         assert_eq!(c.last_good(), Some(ip("47.243.2.2")));
     }
 
@@ -1655,12 +1691,54 @@ mod tests {
         let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 3600);
         let mut c = EndpointController::bootstrap(host(), m, opts(), 0).unwrap();
         c.on_authenticated_at(1_000);
-        assert!(c.on_cycle(1_000, CycleReason::SessionLost).is_none()); // TTL fresh: not even a query
-        assert_eq!(c.queries(), 1);
         c.request_refresh("fifo reconnect");
         let sw = c.on_cycle(2_000, CycleReason::Forced).unwrap();
         assert_eq!(sw.to.ip(), IpAddr::V4(ip("47.243.2.2")));
         assert_eq!(c.queries(), 2);
+    }
+
+    #[test]
+    fn forced_refresh_keeps_current_first_when_dns_still_contains_it() {
+        let m = Mock::new(
+            vec![
+                Ok(vec![ip("47.243.2.2")]),
+                Ok(vec![ip("47.243.1.1"), ip("47.243.2.2"), ip("47.243.1.1")]),
+            ],
+            3600,
+        );
+        let mut c = EndpointController::bootstrap(host(), m, opts(), 0).unwrap();
+        c.on_authenticated_at(1_000);
+        c.request_refresh("fifo reconnect with a reordered multi-answer set");
+        assert!(c.on_cycle(2_000, CycleReason::Forced).is_none());
+        assert_eq!(c.current().ip(), IpAddr::V4(ip("47.243.2.2")));
+        assert_eq!(c.candidates(), &[ip("47.243.2.2"), ip("47.243.1.1")]);
+        assert_eq!(c.queries(), 2);
+    }
+
+    #[test]
+    fn failed_attended_candidate_returns_to_just_authenticated_endpoint_without_fallback_opt_in() {
+        let (dir, cache) = test_paths("attended-default-rollback");
+        let m = Mock::new(vec![Ok(vec![ip("47.243.1.1")]), Ok(vec![ip("47.243.2.2")])], 3600);
+        let mut c = EndpointController::bootstrap(
+            host(),
+            m,
+            EndpointOptions {
+                cache_file: Some(cache.clone()),
+                ..opts()
+            },
+            0,
+        )
+        .unwrap();
+        c.on_authenticated_at(1_000);
+        c.request_refresh("fifo reconnect");
+        c.on_session_ended();
+        let cutover = c.on_cycle(2_000, CycleReason::Forced).unwrap();
+        assert_eq!(cutover.to.ip(), IpAddr::V4(ip("47.243.2.2")));
+        let rollback = c.on_cycle(7_000, CycleReason::AttemptFailed).unwrap();
+        assert_eq!(rollback.to.ip(), IpAddr::V4(ip("47.243.1.1")));
+        assert_eq!(load_cache(&cache, "relay.example.com", 8443).unwrap(), Some(ip("47.243.1.1")));
+        assert!(!fallback_state_path(&cache).exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2060,7 +2138,6 @@ mod tests {
         c.on_authenticated_at(100);
         c.on_authenticated_activity(500, false);
 
-        c.request_refresh("failed replacement");
         assert_eq!(
             c.on_cycle_at(1_000, CycleReason::SessionLost, wall)
                 .unwrap()

@@ -298,8 +298,9 @@ other options:
     --disable-bpf                         disable the kernel space filter,most time its not necessary
                                           unless you suspect there is a bug
     --dev                 <string>        bind raw socket to a device, not necessary but improves performance
-    -r host:port          (client)        a hostname is resolved through --dns-server at startup and again when
-                                          TTL expires at reconnect or refresh is forced; server -r is numeric
+    -r host:port          (client)        a hostname is resolved through --dns-server at startup, whenever a
+                                          failed session reconnects, at expired-TTL reconnects, or when forced;
+                                          server -r remains numeric
     --dns-server          <ip[:port]>     DNS server for a hostname -r; repeat to add more (tried in order)
     --dns-timeout         <ms>            per-server DNS timeout (default 2000)
     --underlay-dev        <string>        native interface for DNS and relay traffic: SO_BINDTODEVICE on the
@@ -543,6 +544,13 @@ pub fn parse_args(raw_args: &[String]) -> Result<ParseOutcome, String> {
     };
     if underlay_gateway.is_some() && cli.underlay_dev.is_none() {
         return Err("--underlay-gateway needs --underlay-dev".into());
+    }
+    if let (Some(dev), Some(underlay)) = (&cli.dev, &cli.underlay_dev) {
+        if dev != underlay {
+            return Err(format!(
+                "--dev {dev} conflicts with --underlay-dev {underlay}; relay send and receive traffic must use the same interface"
+            ));
+        }
     }
     let bootstrap_addr = match &cli.bootstrap_addr {
         Some(b) => {
@@ -924,6 +932,7 @@ mod tests {
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server not-an-ip",  // bad server
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --dns-timeout 5",
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --underlay-gateway 192.168.1.1", // gateway without dev
+            "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --underlay-dev eth0 --dev wg0", // split send/receive path
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr nope",
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr 127.0.0.1",
             "-c -l 127.0.0.1:7000 -r relay.example:8443 --dns-server 1.1.1.1 --bootstrap-addr 10.0.0.1",
