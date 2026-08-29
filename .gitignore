@@ -1,4 +1,5 @@
 /target
 /target-linux
+/dist
 /tools/cpp_harness/build
 *.o

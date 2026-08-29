@@ -5,8 +5,9 @@
 //! * A literal address never resolves anything and behaves exactly as before.
 //! * A hostname is resolved through the explicit `--dns-server`s at startup and when an
 //!   established session enters a reconnect cycle. TTL expiry refreshes the cached answer at
-//!   the next reconnect boundary, and `reconnect` on the fifo forces a refresh. Failed queries
-//!   remain pending and back off exponentially with jitter.
+//!   the next reconnect boundary, and `reconnect` on the fifo forces a refresh. Reconnect
+//!   refresh remains pending until a session authenticates: resolver errors back off
+//!   exponentially with jitter, while usable-but-stale answers retry at the minimum interval.
 //! * An answer only produces *candidates*. The current address stays first; the rest are
 //!   sorted numerically, so a reordered answer changes nothing. A different address is used
 //!   only at a reconnect boundary: immediately when DNS no longer lists the current one, or
@@ -219,6 +220,15 @@ impl Backoff {
         self.failures = 0;
         self.not_before_ms = 0;
     }
+
+    /// Record a usable answer while reconnect refresh is still pending. A successful DNS
+    /// exchange resets failure escalation, but it must not create a per-cycle query loop when
+    /// recursive caches continue returning the dead address.
+    pub fn on_pending_success(&mut self, now_ms: u64) -> u64 {
+        self.failures = 0;
+        self.not_before_ms = now_ms.saturating_add(self.min_ms);
+        self.min_ms
+    }
 }
 
 /// Why the client is (re)starting a connection attempt.
@@ -264,9 +274,9 @@ pub struct EndpointController {
     expires_at_ms: Option<u64>,
     backoff: Backoff,
     force_refresh: bool,
-    /// An established session failed and still needs one successful reconnect-boundary
-    /// refresh. This stays set across resolver failures so a fresh (but long-TTL) cached
-    /// answer cannot suppress retries for the rest of its TTL.
+    /// An established session failed and reconnect-boundary refresh remains armed until a
+    /// replacement or recovered session authenticates. This stays set across resolver errors
+    /// and usable-but-stale answers, so a long TTL cannot suppress recovery retries.
     reconnect_refresh_pending: bool,
     queries: u64,
     /// Failed handshake cycles on DNS-preferred candidates since the last authentication.
@@ -631,9 +641,6 @@ impl EndpointController {
             if self.backoff.ready(now_ms) {
                 self.force_refresh = false;
                 let succeeded = self.query(now_ms);
-                if succeeded {
-                    self.reconnect_refresh_pending = false;
-                }
                 query_succeeded = Some(succeeded);
             } else {
                 log::debug!("endpoint: dns query deferred by backoff ({} failures)", self.backoff.failures());
@@ -654,6 +661,8 @@ impl EndpointController {
     /// Deterministic form used by the state-machine tests.
     fn on_authenticated_at(&mut self, now_ms: u64) -> Option<Ipv4Addr> {
         self.current_authenticated = true;
+        self.reconnect_refresh_pending = false;
+        self.backoff.on_success();
         let IpAddr::V4(cur) = self.current.ip() else {
             return None;
         };
@@ -942,7 +951,15 @@ impl EndpointController {
                     );
                     return false;
                 }
-                self.backoff.on_success();
+                if self.reconnect_refresh_pending {
+                    let delay = self.backoff.on_pending_success(now_ms);
+                    log::info!(
+                        "endpoint: reconnect refresh remains pending until authentication; next query in {:.1}s",
+                        delay as f64 / 1000.0
+                    );
+                } else {
+                    self.backoff.on_success();
+                }
                 self.expires_at_ms = Some(now_ms.saturating_add(u64::from(ans.ttl).saturating_mul(1000)));
                 safe.sort_by_key(|ip| u32::from(*ip));
                 safe.dedup();
@@ -1684,6 +1701,82 @@ mod tests {
         // handshake succeeds on the new one: it becomes last-known-good and the old one is released
         assert_eq!(c.on_authenticated_at(14_000), Some(ip("47.243.1.1")));
         assert_eq!(c.last_good(), Some(ip("47.243.2.2")));
+    }
+
+    #[test]
+    fn successful_stale_answers_keep_reconnect_refresh_armed_until_authentication() {
+        let old = ip("47.243.1.1");
+        let new = ip("47.243.2.2");
+        let m = Mock::new(
+            vec![Ok(vec![old]), Ok(vec![old]), Ok(vec![old]), Ok(vec![new]), Ok(vec![new])],
+            3600,
+        );
+        let mut c = EndpointController::bootstrap(host(), m, opts(), 0).unwrap();
+        c.on_authenticated_at(100);
+
+        // DNS is still stale when the established session first dies. A usable answer must
+        // not clear reconnect refresh, and the next cycle must be rate-limited.
+        assert!(c.on_cycle_at(1_000, CycleReason::SessionLost, 1).is_none());
+        assert_eq!(c.queries(), 2);
+        assert!(c.reconnect_refresh_pending);
+        assert_eq!(c.backoff.failures(), 0);
+        assert!(!c.backoff.ready(2_999));
+        assert!(c.on_cycle_at(2_999, CycleReason::AttemptFailed, 2).is_none());
+        assert_eq!(c.queries(), 2);
+
+        // A second successful stale reply remains pending. DNS then changes well before its
+        // one-hour TTL and the same controller switches without a FIFO request or restart.
+        assert!(c.on_cycle_at(3_000, CycleReason::AttemptFailed, 3).is_none());
+        assert_eq!(c.queries(), 3);
+        assert!(c.reconnect_refresh_pending);
+        let sw = c.on_cycle_at(5_000, CycleReason::AttemptFailed, 5).unwrap();
+        assert_eq!(sw.from.ip(), IpAddr::V4(old));
+        assert_eq!(sw.to.ip(), IpAddr::V4(new));
+        assert!(c.reconnect_refresh_pending);
+
+        // Until authentication, even the new usable answer remains subject to the same
+        // bounded refresh loop. Authentication is the only event that disarms it.
+        assert!(c.on_cycle_at(6_999, CycleReason::AttemptFailed, 6).is_none());
+        assert_eq!(c.queries(), 4);
+        assert!(c.on_cycle_at(7_000, CycleReason::AttemptFailed, 7).is_none());
+        assert_eq!(c.queries(), 5);
+        assert!(c.reconnect_refresh_pending);
+        assert_eq!(c.on_authenticated_at(7_500), Some(old));
+        assert!(!c.reconnect_refresh_pending);
+        assert!(c.backoff.ready(7_500));
+
+        // The fresh one-hour TTL is honored again after authentication; an ordinary failed
+        // attempt cannot create background DNS churn while the session is healthy.
+        assert!(c.on_cycle_at(9_000, CycleReason::AttemptFailed, 9).is_none());
+        assert_eq!(c.queries(), 5);
+    }
+
+    #[test]
+    fn endless_usable_stale_answers_are_limited_to_one_query_per_minimum_interval() {
+        let old = ip("47.243.1.1");
+        let m = Mock::new(vec![Ok(vec![old]), Ok(vec![old])], 3600);
+        let mut c = EndpointController::bootstrap(host(), m, opts(), 0).unwrap();
+        c.on_authenticated_at(100);
+
+        for now_ms in (1_000..=9_900).step_by(100) {
+            let reason = if now_ms == 1_000 {
+                CycleReason::SessionLost
+            } else {
+                CycleReason::AttemptFailed
+            };
+            assert!(c.on_cycle_at(now_ms, reason, now_ms / 1_000).is_none());
+        }
+        // Startup plus reconnect queries at 1s, 3s, 5s, 7s and 9s.
+        assert_eq!(c.queries(), 6);
+        assert!(c.reconnect_refresh_pending);
+        assert_eq!(c.backoff.failures(), 0);
+
+        c.on_authenticated_at(9_950);
+        assert!(!c.reconnect_refresh_pending);
+        for now_ms in (10_000..=20_000).step_by(100) {
+            assert!(c.on_cycle_at(now_ms, CycleReason::AttemptFailed, now_ms / 1_000).is_none());
+        }
+        assert_eq!(c.queries(), 6);
     }
 
     #[test]

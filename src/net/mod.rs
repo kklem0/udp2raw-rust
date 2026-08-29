@@ -85,7 +85,16 @@ impl<A: Copy> RecvBatch<A> {
             h.msg_flags = 0;
             self.msgs[i].msg_len = 0;
         }
-        let r = unsafe { libc::recvmmsg(fd, self.msgs.as_mut_ptr(), n as libc::c_uint, libc::MSG_DONTWAIT, std::ptr::null_mut()) };
+        // glibc and musl expose different integer types for the flags argument.
+        let r = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
@@ -212,7 +221,15 @@ pub fn send_batch(fd: RawFd, pkts: &[TxPacket], sc: &mut SendScratch) -> usize {
         }
         let mut done = 0usize;
         while done < n {
-            let r = unsafe { libc::sendmmsg(fd, sc.msgs.as_mut_ptr().add(done), (n - done) as libc::c_uint, libc::MSG_DONTWAIT) };
+            // glibc and musl expose different integer types for the flags argument.
+            let r = unsafe {
+                libc::sendmmsg(
+                    fd,
+                    sc.msgs.as_mut_ptr().add(done),
+                    (n - done) as libc::c_uint,
+                    libc::MSG_DONTWAIT as _,
+                )
+            };
             if r < 0 {
                 let e = io::Error::last_os_error();
                 match e.kind() {

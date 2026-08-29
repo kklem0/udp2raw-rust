@@ -190,13 +190,26 @@ expect_not "no switch while the session is healthy" grep -q "relay is now" "$CLO
 expect "at most one refresh query while healthy (was $Q1, now $(dns_queries))" [ "$(( $(dns_queries) - Q1 ))" -le 1 ]
 expect "probe still fine" probe
 
-phase "A3 current address fails: re-resolve and switch in-process" A2
+phase "A3 current address fails before DNS changes: stale-success refresh stays armed" A2
+# Model the real blocked-EIP race: the established relay dies while recursive DNS still
+# returns the old address with an hour of TTL. The first forced reconnect lookup therefore
+# succeeds but is stale. Only after observing that lookup do we publish the replacement.
+echo "relay.test 10.99.1.10 3600" > "$ANS"
+Q_STALE_BEFORE=$(dns_queries)
 down_addr 10
+if wait_log "reconnect refresh remains pending until authentication" 40; then
+    ok "successful stale DNS answer kept reconnect refresh armed"
+else
+    bad "stale successful DNS answer disarmed reconnect refresh"; tail -12 "$CLOG"
+fi
+Q_AFTER_STALE=$(dns_queries)
+expect "session loss queried stale DNS before the 3600-second TTL" [ "$Q_AFTER_STALE" -gt "$Q_STALE_BEFORE" ]
+echo "relay.test 10.99.1.20 3600" > "$ANS"
 if wait_log "relay is now 10.99.1.20" 40; then ok "switched to 10.99.1.20 after the session died"; else bad "no switch"; tail -8 "$CLOG"; fi
 if wait_ready 2 20; then ok "client_ready on 10.99.1.20"; else bad "not ready on the new address"; tail -8 "$CLOG"; fi
 expect "same process" kill -0 "$PID0"
 expect "same local UDP listener socket ($INO0)" [ "$(listener_ino)" = "$INO0" ]
-expect "session loss refreshed DNS before the 3600-second cached TTL" [ "$(dns_queries)" -gt "$Q1" ]
+expect "a later pre-TTL query discovered the replacement" [ "$(dns_queries)" -gt "$Q_AFTER_STALE" ]
 expect "probe through the new address" probe
 expect "route 10.99.1.20/32 installed" route_has 10.99.1.20
 expect_not "route 10.99.1.10/32 removed after authentication" route_has 10.99.1.10

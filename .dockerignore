@@ -1,0 +1,4 @@
+**
+!tools/
+!tools/release/
+!tools/release/Dockerfile.arm64-static

@@ -141,7 +141,9 @@ pub fn interface_has_arp(name: &str) -> io::Result<bool> {
     for (i, b) in bytes.iter().enumerate() {
         ifr.ifr_name[i] = *b as libc::c_char;
     }
-    let r = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) };
+    // `libc::Ioctl` is `c_ulong` for glibc targets but `c_int` for musl. Let the
+    // function signature infer the request type so this stays portable across both.
+    let r = unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr) };
     let err = io::Error::last_os_error();
     unsafe { libc::close(fd) };
     if r < 0 {

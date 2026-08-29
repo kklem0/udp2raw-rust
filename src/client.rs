@@ -40,6 +40,14 @@ enum State {
     Ready,
 }
 
+fn raw_disabled_cycle_reason(state: State) -> CycleReason {
+    if state == State::Ready {
+        CycleReason::SessionLost
+    } else {
+        CycleReason::AttemptFailed
+    }
+}
+
 /// The native interface for relay traffic (`--underlay-dev`) and what a host route through
 /// it needs.
 #[derive(Clone)]
@@ -87,7 +95,89 @@ impl Underlay {
 
 #[cfg(test)]
 mod endpoint_resource_tests {
-    use super::{EndpointResources, ManagedState, ReconcileResult};
+    use super::{
+        raw_disabled_cycle_reason, EndpointResources, ManagedState, ReconcileResult, State,
+    };
+    use crate::dns::{DnsAnswer, DnsError, Resolve};
+    use crate::endpoint::{CycleReason, EndpointController, EndpointOptions, EndpointSpec};
+    use std::collections::VecDeque;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct ScriptedResolver {
+        answers: Mutex<VecDeque<Vec<Ipv4Addr>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Resolve for ScriptedResolver {
+        fn resolve_a(&self, _name: &str) -> Result<DnsAnswer, DnsError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut answers = self.answers.lock().unwrap();
+            let addrs = if answers.len() > 1 {
+                answers.pop_front().unwrap()
+            } else {
+                answers.front().cloned().unwrap()
+            };
+            Ok(DnsAnswer {
+                addrs,
+                ttl: 3_600,
+                raw_ttl: 3_600,
+                server: "127.0.0.1:53".parse().unwrap(),
+                cnames: Vec::new(),
+                via_tcp: false,
+            })
+        }
+    }
+
+    #[test]
+    fn ready_faketcp_rst_disable_keeps_long_ttl_dns_refresh_pending() {
+        let old: Ipv4Addr = "47.243.1.1".parse().unwrap();
+        let replacement: Ipv4Addr = "47.243.2.2".parse().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = ScriptedResolver {
+            answers: Mutex::new(VecDeque::from([vec![old], vec![old], vec![replacement]])),
+            calls: Arc::clone(&calls),
+        };
+        let mut endpoint = EndpointController::bootstrap(
+            EndpointSpec::parse("relay.example.com:8443").unwrap(),
+            Box::new(resolver),
+            EndpointOptions::default(),
+            0,
+        )
+        .unwrap();
+        endpoint.on_authenticated();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let reason = raw_disabled_cycle_reason(State::Ready);
+        assert_eq!(reason, CycleReason::SessionLost);
+        assert!(endpoint.on_cycle(1_000, reason).is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(endpoint.current().ip(), IpAddr::V4(old));
+
+        // The resolver returned a usable but dead address with a fresh one-hour TTL. The
+        // reconnect refresh remains armed, but retries no faster than the minimum interval.
+        assert!(endpoint
+            .on_cycle(2_999, CycleReason::AttemptFailed)
+            .is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let switched = endpoint
+            .on_cycle(3_000, CycleReason::AttemptFailed)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(switched.from.ip(), IpAddr::V4(old));
+        assert_eq!(switched.to.ip(), IpAddr::V4(replacement));
+
+        for state in [
+            State::Idle,
+            State::TcpHandshake,
+            State::TcpHandshakeDummy,
+            State::Handshake1,
+            State::Handshake2,
+        ] {
+            assert_eq!(raw_disabled_cycle_reason(state), CycleReason::AttemptFailed);
+        }
+    }
 
     #[test]
     fn every_route_rule_add_failure_combination_retries_independently() {
@@ -1044,7 +1134,7 @@ impl Client {
         log::trace!("timer! roller my {},oppsite {},{}", self.info.my_roller, self.info.oppsite_roller, self.info.last_oppsite_roller_time);
 
         if self.info.raw.disabled {
-            self.go_idle(CycleReason::AttemptFailed, "");
+            self.go_idle(raw_disabled_cycle_reason(self.state), "");
         }
         if self.state == State::Idle {
             if !self.attempt_endpoint_selected {

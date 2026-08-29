@@ -1,0 +1,7 @@
+# The base is an immutable multi-architecture manifest. The release script resolves, validates,
+# records, and then executes only the loaded linux/arm64 builder image ID.
+FROM rust:1.85.1-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
+
+RUN rustup target add aarch64-unknown-linux-musl
+
+WORKDIR /src

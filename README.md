@@ -61,9 +61,14 @@ sudo apt-get install g++-aarch64-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     cargo build --release --target aarch64-unknown-linux-gnu
-# fully static binary without a local cross toolchain (needs Docker):
-cargo install cross && cross build --release --target aarch64-unknown-linux-musl
+# reproducible static Pi 4/5 release (needs Docker; requires a clean commit):
+tools/release/build_arm64_static.sh
 ```
+
+The release script snapshots one clean commit, builds it twice offline using the captured ID of a
+pinned ARM64 container, verifies matching hashes and a static AArch64 ELF, and atomically publishes
+a versioned directory containing the binary, attestation, and checksums. See
+[`docs/release-arm64-static.md`](docs/release-arm64-static.md).
 
 ## Usage
 
@@ -121,8 +126,10 @@ expired or DNS now prefers another address. Resolution happens at startup or fro
 reconnect boundary. A failed established session always starts a fresh lookup even if the
 cached TTL has time left. If that lookup fails, its refresh intent remains pending and is
 retried with bounded exponential backoff and jitter; the current and committed-good
-addresses are retained. TTL expiry means the *next* other reconnect must also refresh the
-answer.
+addresses are retained. A usable answer that still points at the dead address also leaves
+the refresh pending: it is retried at the minimum interval instead of being suppressed by
+the answer's fresh TTL, and only authentication clears that pending state. TTL expiry means
+the *next* other reconnect must also refresh the answer.
 
 Options specific to hostname endpoints and rollback:
 
