@@ -21,9 +21,10 @@ What is different from the C++ version:
   fallback is 2–4× slower for udp2raw's serial CBC encryption. `--aes-backend
   auto|hw|table|fixslice` overrides the choice.
 * **Hostname relay endpoints with in-process switching.** A client `-r host:port` is
-  re-resolved through explicit `--dns-server`s when its TTL expires at a reconnect boundary
-  or a refresh is forced; a new address is adopted without changing the process, the local
-  listener or WireGuard. See "Hostname endpoints".
+  re-resolved through explicit `--dns-server`s whenever an established session enters a
+  reconnect cycle, when an expired TTL is observed at another reconnect boundary, or when a
+  refresh is forced; a new address is adopted without changing the process, local listener,
+  or WireGuard configuration. See "Hostname endpoints".
 * **Linux only.** Windows/macOS (the `udp2raw-multiplatform` pcap build) is not ported.
 * No per-packet `/dev/urandom` reads, no per-packet heap churn in the hot path, and the
   code is memory-safe — it runs as root / with `CAP_NET_RAW` and parses untrusted packets.
@@ -117,7 +118,11 @@ A client `-r` may be a hostname. It is resolved only through the explicitly conf
 same process, so the PID and local UDP listener do not change. The conservative v1 policy is
 availability-first: a healthy Ready session is not interrupted merely because its DNS TTL
 expired or DNS now prefers another address. Resolution happens at startup or from a
-reconnect boundary; TTL expiry means the *next* reconnect must refresh the answer.
+reconnect boundary. A failed established session always starts a fresh lookup even if the
+cached TTL has time left. If that lookup fails, its refresh intent remains pending and is
+retried with bounded exponential backoff and jitter; the current and committed-good
+addresses are retained. TTL expiry means the *next* other reconnect must also refresh the
+answer.
 
 Options specific to hostname endpoints and rollback:
 
@@ -326,34 +331,57 @@ Failure-state summary:
 second TTL. Multiple answers are bounded safely, but one record makes an attended migration
 and its rollback unambiguous.
 
-Example (AliDNS, native `eth0`, opt-in fallback and attended FIFO authority):
+Karsen example (AliDNS, native `eth0`, and an attended FIFO cutover):
 
 ```sh
-sudo ./udp2raw -c -l 127.0.0.1:7000 -r relay.example.com:8443 \
-    -k "passwd" --raw-mode faketcp -a --fix-gro \
+sudo ./udp2raw -c -l 127.0.0.1:7000 -r hk1b-udp2raw.clement.hk:8443 \
+    --key-file /etc/udp2raw/key --raw-mode faketcp -a --fix-gro \
     --dns-server 223.5.5.5:53 --dns-server 223.6.6.6:53 \
-    --underlay-dev eth0 --fifo /run/udp2raw.fifo \
-    --endpoint-cache /var/lib/udp2raw/endpoint_relay.example.com_8443 \
-    --last-good-fallback
+    --underlay-dev eth0 --fifo /run/udp2raw-karsen/control.fifo
 ```
+
+Wutong example (the same relay identity and resolver policy, with independent local state):
+
+```sh
+sudo ./udp2raw -c -l 127.0.0.1:7000 -r hk1b-udp2raw.clement.hk:8443 \
+    --key-file /etc/udp2raw/key --raw-mode faketcp -a --fix-gro \
+    --dns-server 223.5.5.5:53 --dns-server 223.6.6.6:53 \
+    --underlay-dev eth0 --fifo /run/udp2raw-wutong/control.fifo
+```
+
+The default cache for both examples is
+`/var/lib/udp2raw/endpoint_hk1b-udp2raw.clement.hk_8443`; each is local to its own host.
+Add `--underlay-gateway <native-lan-gateway>` when the gateway cannot be learned from an
+existing native route. `--last-good-fallback` and its tuning flags are optional, separately
+documented controls for bounded *unattended* old-address probes; a failed candidate selected
+by the attended FIFO command returns directly to the endpoint that command interrupted even
+without that opt-in.
 
 Attended rotation workflow:
 
 1. Prepare the new relay and independently verify its key, mode, listener, firewall and real
    gateway traffic path. Keep the old relay running.
-2. Change DNS, then request one cutover with `echo reconnect > /run/udp2raw.fifo`.
-3. While the new address is probationary, let the external health collector measure the real
-   service path. Send `promote <new-ip>` only after it is healthy; send `rollback <new-ip>`
-   immediately if it black-holes or degrades traffic.
-4. Retire the old relay only after the promotion log confirms the new committed-good address
-   and release of the previous endpoint.
+2. Update the one unproxied `A` record to the new address.
+3. Keep the old EIP/listener/firewall through at least the full 30–60 second TTL grace period,
+   including resolver and clock skew. Healthy sessions remain on it during this interval.
+4. After the grace period, request one cutover with
+   `echo reconnect > /run/udp2raw-karsen/control.fifo` (and the Wutong FIFO), or retire the
+   old relay and let normal failure detection trigger the reconnect-boundary lookup.
+5. With `--last-good-fallback`, let the external health collector measure the real service
+   path while the new address is probationary. Send `promote <new-ip>` only after it is
+   healthy; send `rollback <new-ip>` immediately if it black-holes or degrades traffic.
+   Without that opt-in, the authenticated udp2raw handshake commits the candidate directly.
+6. Retire the old EIP only after every client log confirms the new committed-good address
+   (and, when probation is enabled, promotion and release of the previous endpoint).
 
 Automatic migration from a healthy fallback is deliberately deferred. A future version may
 add an independent parallel canary socket/session with measured packet-loss bounds and true
 make-before-break behavior; v1 never performs recurring destructive convergence probes.
-For break-glass startup when DNS itself is unavailable, the strict cache and safe
-`--bootstrap-addr` remain available, or use a literal `-r <ip>:<port>` to retain classic
-no-resolution behavior.
+Rollback by restoring the prior `A` record while the old relay is still prepared, waiting
+through the TTL grace period, and issuing the endpoint-qualified FIFO cutover/rollback as
+appropriate. For break-glass startup when DNS itself is unavailable, the strict cache and a
+safe `--bootstrap-addr` remain available. A literal `-r <ip>:<port>` with no hostname options
+restores classic no-resolution behavior and is the final numeric escape hatch.
 
 ## Performance
 

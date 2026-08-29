@@ -143,6 +143,11 @@ start_client2() {
     $C "$RUST" -c -l 127.0.0.1:3334 -r relay.test:4096 -k pw -a --log-level 4 --fix-gro --dns-server 10.99.0.2:53 --dns-timeout 500 --allow-private-endpoint --endpoint-cache "$CACHE2" --fifo "$FIFO2" "$@" > "$CLOG2" 2>&1 &
     CPID2=$!
 }
+start_easy_client() {
+    : > "$CLOG"
+    $C "$RUST" -c -l 127.0.0.1:3333 -r relay.test:4096 -k pw --raw-mode easy-faketcp --log-level 5 --fix-gro --dns-server 10.99.0.2:53 --dns-timeout 500 --allow-private-endpoint --endpoint-cache "$CACHE" --fifo "$FIFO" "$@" > "$CLOG" 2>&1 &
+    CPID=$!
+}
 stop_client() { [ -z "$CPID" ] || { kill "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true; }; CPID=""; sleep 0.5; }
 stop_client2() { [ -z "$CPID2" ] || { kill "$CPID2" 2>/dev/null || true; wait "$CPID2" 2>/dev/null || true; }; CPID2=""; sleep 0.5; }
 phase() { echo "== $1"; cp "$CLOG" "$LOGDIR/client.$2.log" 2>/dev/null || true; }
@@ -161,7 +166,7 @@ mac0=$($C cat /sys/class/net/veth0/address); mac1=$($P cat /sys/class/net/veth1/
 $C ip neigh replace 10.99.0.2 lladdr "$mac1" dev veth0 nud permanent
 $P ip neigh replace 10.99.0.1 lladdr "$mac0" dev veth1 nud permanent
 $C ip route add blackhole default
-echo "relay.test 10.99.1.10 10" > "$ANS"
+echo "relay.test 10.99.1.10 3600" > "$ANS"
 $P python3 tools/dns_stub.py 10.99.0.2 53 "$ANS" 2> "$LOGDIR/stub.log" & pids+=($!)
 $P python3 tools/udp_echo.py 127.0.0.1 7777 & pids+=($!)
 $P python3 tools/docker/udp_sink.py 127.0.0.1 7799 & pids+=($!)
@@ -179,7 +184,7 @@ expect "probe through the tunnel" probe
 expect "cache holds 10.99.1.10 after the authenticated handshake" [ "$(cache_addr)" = "10.99.1.10" ]
 PID0=$CPID; INO0=$(listener_ino); echo "   pid $PID0 listener $INO0"
 phase "A2 healthy session: DNS moves to 10.99.1.20, nothing changes" A1
-echo "relay.test 10.99.1.20 10" > "$ANS"
+echo "relay.test 10.99.1.20 3600" > "$ANS"
 Q1=$(dns_queries); sleep 14
 expect_not "no switch while the session is healthy" grep -q "relay is now" "$CLOG"
 expect "at most one refresh query while healthy (was $Q1, now $(dns_queries))" [ "$(( $(dns_queries) - Q1 ))" -le 1 ]
@@ -191,6 +196,7 @@ if wait_log "relay is now 10.99.1.20" 40; then ok "switched to 10.99.1.20 after 
 if wait_ready 2 20; then ok "client_ready on 10.99.1.20"; else bad "not ready on the new address"; tail -8 "$CLOG"; fi
 expect "same process" kill -0 "$PID0"
 expect "same local UDP listener socket ($INO0)" [ "$(listener_ino)" = "$INO0" ]
+expect "session loss refreshed DNS before the 3600-second cached TTL" [ "$(dns_queries)" -gt "$Q1" ]
 expect "probe through the new address" probe
 expect "route 10.99.1.20/32 installed" route_has 10.99.1.20
 expect_not "route 10.99.1.10/32 removed after authentication" route_has 10.99.1.10
@@ -220,8 +226,9 @@ expect "old rule (.10) retained while the candidate is unauthenticated" rule_has
 expect "old route (.10) retained" route_has 10.99.1.10
 expect "cache untouched by the unauthenticated candidate" [ "$(cache_addr)" = "10.99.1.10" ]
 expect "handshake to the candidate times out" wait_log "state back to client_idle from client_tcp_handshake" 12
-echo "relay.test 10.99.1.10 10" > "$ANS"
-if wait_log "relay is now 10.99.1.10:4096 (was 10.99.1.99" 30 && wait_ready 4 20; then ok "back on 10.99.1.10 once DNS says so"; else bad "no recovery from the bad candidate"; tail -8 "$CLOG"; fi
+if wait_log "attended candidate 10.99.1.99 failed; returning directly to preserved 10.99.1.10" 15 && wait_ready 4 20; then ok "bad attended candidate rolled back without another DNS change"; else bad "no direct rollback from the bad candidate"; tail -8 "$CLOG"; fi
+expect "same process after failed candidate rollback" kill -0 "$PID0"
+expect "same listener after failed candidate rollback" [ "$(listener_ino)" = "$INO0" ]
 expect_not "candidate rule rolled back" rule_has 10.99.1.99
 expect_not "candidate route rolled back" route_has 10.99.1.99
 expect "probe" probe
@@ -275,7 +282,23 @@ sleep 8
 expect_not "control: never ready without the underlay route" wait_ready 1 1
 stop_client
 
-phase "D0 last-good fallback remains opt-in" C
+phase "C2 easy-faketcp retargets its kernel socket and keeps the listener" C
+clear_endpoint_state; up_addr 10; up_addr 20
+echo "relay.test 10.99.1.10 3600" > "$ANS"
+start_easy_client --underlay-dev veth0 --underlay-gateway 10.99.0.2
+if wait_ready 1 20; then ok "easy-faketcp ready on .10"; else bad "easy-faketcp did not become ready on .10"; tail -10 "$CLOG"; fi
+EPID=$CPID; EINO=$(listener_ino)
+expect "easy-faketcp socket initially targets .10" grep -q "easy-faketcp socket destination is now 10.99.1.10:4096" "$CLOG"
+echo "relay.test 10.99.1.20 3600" > "$ANS"; echo reconnect > "$FIFO"
+if wait_log "easy-faketcp socket destination is now 10.99.1.20:4096" 15 && wait_ready 2 20; then ok "easy-faketcp retargeted to .20"; else bad "easy-faketcp did not retarget to .20"; tail -12 "$CLOG"; fi
+expect "easy-faketcp switch keeps the process" [ "$CPID" = "$EPID" ]
+expect "easy-faketcp switch keeps the local listener" [ "$(listener_ino)" = "$EINO" ]
+expect "easy-faketcp new destination uses a native host route" route_has 10.99.1.20
+expect "easy-faketcp tunnel works after retarget" probe
+stop_client
+expect_not "easy-faketcp route is cleaned at exit" route_has 10.99.1.20
+
+phase "D0 last-good fallback remains opt-in" C2
 up_addr 10; up_bad_addr 99
 clear_endpoint_state; write_cache 10.99.1.10
 echo "relay.test 10.99.1.99 1" > "$ANS"

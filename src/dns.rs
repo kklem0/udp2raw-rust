@@ -347,25 +347,40 @@ fn interpret(m: &Message, qname: &Name, server: SocketAddr, via_tcp: bool) -> Re
     let answers = m.answers();
     let mut name = qname.clone();
     let mut cnames = Vec::new();
+    let mut chain_ttl = u32::MAX;
     loop {
         let mut addrs: Vec<Ipv4Addr> = Vec::new();
-        let mut ttl = u32::MAX;
-        for r in answers.iter().filter(|r| r.name() == &name) {
+        let mut address_ttl = u32::MAX;
+        let records: Vec<_> = answers.iter().filter(|r| r.name() == &name).collect();
+        for r in &records {
             if let RData::A(a) = r.data() {
                 addrs.push(a.0);
-                ttl = ttl.min(r.ttl());
+                address_ttl = address_ttl.min(r.ttl());
             }
         }
         if !addrs.is_empty() {
-            let raw_ttl = ttl;
+            if records.iter().any(|r| matches!(r.data(), RData::CNAME(_))) {
+                return Err(DnsError::Malformed(format!("{} has both CNAME and A records", name.to_ascii())));
+            }
+            // A cached alias is valid only as long as every CNAME link and the terminal A
+            // record used to construct it. Using only the A TTL can pin a changed alias.
+            let raw_ttl = chain_ttl.min(address_ttl);
             return Ok(DnsAnswer { addrs, ttl: raw_ttl.clamp(TTL_MIN_SECS, TTL_MAX_SECS), raw_ttl, server, cnames, via_tcp });
         }
-        let cname = answers.iter().filter(|r| r.name() == &name).find_map(|r| match r.data() {
-            RData::CNAME(c) => Some(c.0.clone()),
-            _ => None,
-        });
+        let cname_records: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.data() {
+                RData::CNAME(c) => Some((c.0.clone(), r.ttl())),
+                _ => None,
+            })
+            .collect();
+        let cname = cname_records.first().map(|(target, _)| target.clone());
         match cname {
             Some(target) => {
+                if cname_records.iter().any(|(other, _)| other != &target) {
+                    return Err(DnsError::Malformed(format!("conflicting CNAME records for {}", name.to_ascii())));
+                }
+                let ttl = cname_records.iter().map(|(_, ttl)| *ttl).min().unwrap_or(u32::MAX);
                 if cnames.len() >= MAX_CNAME_HOPS {
                     return Err(DnsError::Malformed("cname chain too long".into()));
                 }
@@ -373,6 +388,7 @@ fn interpret(m: &Message, qname: &Name, server: SocketAddr, via_tcp: bool) -> Re
                     return Err(DnsError::Malformed("cname loop".into()));
                 }
                 cnames.push(target.to_ascii());
+                chain_ttl = chain_ttl.min(ttl);
                 name = target;
             }
             None => return Err(DnsError::NoData),
@@ -505,7 +521,7 @@ pub fn check_endpoint(addr: IpAddr, allow_private: bool) -> Result<(), &'static 
 mod tests {
     use super::*;
     use hickory_proto::rr::Record;
-    use hickory_proto::rr::rdata::{A, CNAME};
+    use hickory_proto::rr::rdata::{A, AAAA, CNAME};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -514,6 +530,9 @@ mod tests {
     }
     fn cname(name: &str, ttl: u32, target: &str) -> Record {
         Record::from_rdata(parse_name(name).unwrap(), ttl, RData::CNAME(CNAME(parse_name(target).unwrap())))
+    }
+    fn aaaa(name: &str, ttl: u32, ip: &str) -> Record {
+        Record::from_rdata(parse_name(name).unwrap(), ttl, RData::AAAA(AAAA(ip.parse().unwrap())))
     }
 
     /// What a stub server does with each query.
@@ -604,7 +623,10 @@ mod tests {
 
     #[test]
     fn single_answer() {
-        let s = stub(Behaviour::Answer(vec![a("relay.example.", 60, [47, 243, 1, 10])]));
+        let s = stub(Behaviour::Answer(vec![
+            aaaa("relay.example.", 1, "2001:db8::1"),
+            a("relay.example.", 60, [47, 243, 1, 10]),
+        ]));
         let ans = resolve_a(&cfg(&[&s]), "relay.example").unwrap();
         assert_eq!(ans.addrs, vec![Ipv4Addr::new(47, 243, 1, 10)]);
         assert_eq!(ans.ttl, 60);
@@ -632,6 +654,27 @@ mod tests {
         assert_eq!(ans.ttl, 45);
         let s2 = stub(Behaviour::Answer(vec![cname("relay.example.", 300, "edge.example."), cname("edge.example.", 300, "relay.example.")]));
         assert!(matches!(resolve_a(&cfg(&[&s2]), "relay.example"), Err(DnsError::AllFailed(ref v)) if matches!(v[0].1, DnsError::Malformed(_))));
+
+        let short_alias = stub(Behaviour::Answer(vec![
+            cname("relay.example.", 5, "edge.example."),
+            a("edge.example.", 600, [47, 243, 1, 8]),
+        ]));
+        let ans = resolve_a(&cfg(&[&short_alias]), "relay.example").unwrap();
+        assert_eq!(ans.raw_ttl, 5, "the CNAME link, not only the terminal A, bounds cache life");
+        assert_eq!(ans.ttl, TTL_MIN_SECS);
+
+        let conflicting = stub(Behaviour::Answer(vec![
+            cname("relay.example.", 60, "one.example."),
+            cname("relay.example.", 60, "two.example."),
+            a("one.example.", 60, [47, 243, 1, 9]),
+        ]));
+        assert!(matches!(resolve_a(&cfg(&[&conflicting]), "relay.example"), Err(DnsError::AllFailed(ref v)) if matches!(v[0].1, DnsError::Malformed(_))));
+
+        let cname_and_a = stub(Behaviour::Answer(vec![
+            cname("relay.example.", 60, "edge.example."),
+            a("relay.example.", 60, [47, 243, 1, 10]),
+        ]));
+        assert!(matches!(resolve_a(&cfg(&[&cname_and_a]), "relay.example"), Err(DnsError::AllFailed(ref v)) if matches!(v[0].1, DnsError::Malformed(_))));
     }
 
     #[test]

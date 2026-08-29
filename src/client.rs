@@ -127,10 +127,25 @@ mod endpoint_resource_tests {
                 );
                 assert_eq!(state.route, ManagedState::Present);
                 assert_eq!(state.rule, ManagedState::Present);
+                assert!(state.ready());
                 assert_eq!(route_calls, if route_first_ok { 1 } else { 2 });
                 assert_eq!(rule_calls, if rule_first_ok { 1 } else { 2 });
             }
         }
+    }
+
+    #[test]
+    fn endpoint_attempt_is_gated_until_every_managed_resource_is_present() {
+        let mut state = EndpointResources::new(true, true);
+        assert!(!state.ready());
+        state.attempt_adds(|| true, || false);
+        assert_eq!(state.route, ManagedState::Present);
+        assert_eq!(state.rule, ManagedState::Missing);
+        assert!(!state.ready(), "a route alone must not permit traffic before the DROP rule exists");
+        state.attempt_adds(|| unreachable!(), || true);
+        assert!(state.ready());
+        state.begin_release();
+        assert!(!state.ready(), "a resource being released cannot authorize a new attempt");
     }
 
     #[test]
@@ -431,6 +446,12 @@ impl EndpointResources {
             && matches!(self.route, ManagedState::Missing | ManagedState::NotNeeded)
             && matches!(self.rule, ManagedState::Missing | ManagedState::NotNeeded)
     }
+
+    fn ready(&self) -> bool {
+        !self.releasing
+            && matches!(self.route, ManagedState::Present | ManagedState::NotNeeded)
+            && matches!(self.rule, ManagedState::Present | ManagedState::NotNeeded)
+    }
 }
 
 /// Kernel state this process installed for one relay address.
@@ -468,6 +489,16 @@ struct Client {
     ipt: Option<Arc<Iptables>>,
     underlay: Option<Underlay>,
     installed: Vec<Installed>,
+    /// The endpoint controller has selected the address for this Idle attempt. Kernel and
+    /// link-layer prerequisites may still be retrying; they must not be reported back to the
+    /// controller as handshake failures until a packet was actually allowed to leave.
+    attempt_endpoint_selected: bool,
+    /// `--lower-level auto` must re-resolve its link-layer destination after an IP switch.
+    /// A failed refresh gates the attempt instead of sending the new endpoint to a stale MAC.
+    lower_level_ready: bool,
+    /// Avoid hammering netlink, iptables, or source/link-layer discovery while an endpoint's
+    /// local prerequisites are unavailable.
+    setup_not_before_ms: u64,
     /// Last periodic retry of incomplete route/rule installation or cleanup.
     last_kernel_retry_ms: u64,
     /// Why the next attempt from `Idle` starts (set wherever `go_idle` is called).
@@ -567,6 +598,9 @@ pub fn run(cfg: Config, crypto: Arc<Crypto>, const_id: u32, exit_flag: &'static 
         ipt,
         underlay,
         installed: Vec::new(),
+        attempt_endpoint_selected: false,
+        lower_level_ready: true,
+        setup_not_before_ms: 0,
         last_kernel_retry_ms: 0,
         cycle_reason: CycleReason::Startup,
         exit_flag,
@@ -692,6 +726,8 @@ impl Client {
     fn go_idle(&mut self, reason: CycleReason, why: &str) {
         self.endpoint.on_session_ended();
         self.cycle_reason = reason;
+        self.attempt_endpoint_selected = false;
+        self.setup_not_before_ms = 0;
         self.state = State::Idle;
         self.info.my_id = secure_random_u32_nz();
         self.generation += 1;
@@ -1011,22 +1047,39 @@ impl Client {
             self.go_idle(CycleReason::AttemptFailed, "");
         }
         if self.state == State::Idle {
-            self.info.raw.rst_received = 0;
-            self.info.raw.disabled = false;
-            self.fail_time_counter += 1;
-            self.info.anti_replay.re_init();
-            self.info.my_id = secure_random_u32_nz();
-            self.generation += 1;
+            if !self.attempt_endpoint_selected {
+                self.info.raw.rst_received = 0;
+                self.info.raw.disabled = false;
+                self.fail_time_counter += 1;
+                self.info.anti_replay.re_init();
+                self.info.my_id = secure_random_u32_nz();
+                self.generation += 1;
 
-            // a hostname -r: re-resolve when due and adopt a new relay address before the attempt
-            let reason = std::mem::replace(&mut self.cycle_reason, CycleReason::AttemptFailed);
-            if let Some(sw) = self.endpoint.on_cycle(now, reason) {
-                self.apply_switch(&sw);
+                // A hostname -r: refresh at the reconnect boundary and adopt a candidate
+                // before preparing this attempt. Setup failures below keep this selection
+                // pending rather than pretending that its handshake failed.
+                let reason = std::mem::replace(&mut self.cycle_reason, CycleReason::AttemptFailed);
+                if let Some(sw) = self.endpoint.on_cycle(now, reason) {
+                    self.apply_switch(&sw);
+                }
+                self.attempt_endpoint_selected = true;
+                self.setup_not_before_ms = 0;
             }
-            // make sure the address we are about to use has its DROP rule (retries a rule
-            // whose install failed on an earlier cycle; a no-op once it is in place)
+            if now < self.setup_not_before_ms {
+                return;
+            }
+            // Do not send the first packet until the exact DROP rule and native host route
+            // (when configured) are both confirmed present.
             let cur = self.remote;
-            self.ensure_installed(cur);
+            if !self.endpoint_resources_ready(cur) {
+                log::debug!("endpoint: waiting for route/firewall prerequisites for {cur}");
+                self.setup_not_before_ms = now.saturating_add(KERNEL_RESOURCE_RETRY_MS);
+                return;
+            }
+            if !self.refresh_lower_level_for_current() {
+                self.setup_not_before_ms = now.saturating_add(KERNEL_RESOURCE_RETRY_MS);
+                return;
+            }
 
             let src_ip = match self.cfg.source_ip {
                 Some(ip) => ip,
@@ -1037,6 +1090,7 @@ impl Client {
                     }
                     Err(e) => {
                         log::warn!("get_src_adress() failed: {e}");
+                        self.setup_not_before_ms = now.saturating_add(KERNEL_RESOURCE_RETRY_MS);
                         return;
                     }
                 },
@@ -1074,10 +1128,17 @@ impl Client {
                 RawMode::FakeTcp => {
                     if self.cfg.easy_faketcp {
                         if let Some(fd) = self.bind_fd {
+                            if let Some(underlay) = &self.underlay {
+                                if let Err(e) = addr::bind_to_device(fd, &underlay.dev) {
+                                    log::warn!("easy-faketcp socket could not bind to underlay {}: {e}", underlay.dev);
+                                    self.setup_not_before_ms = now.saturating_add(KERNEL_RESOURCE_RETRY_MS);
+                                    return;
+                                }
+                            }
                             let _ = addr::set_nonblocking(fd);
                             let (sa, len) = addr::to_sockaddr(self.remote);
                             let ret = unsafe { libc::connect(fd, &sa as *const _ as *const libc::sockaddr, len) };
-                            log::debug!("ret={ret},errno={}, {fd} {}", io::Error::last_os_error(), self.remote);
+                            log::debug!("easy-faketcp socket destination is now {}; ret={ret}, errno={}, fd={fd}", self.remote, io::Error::last_os_error());
                         }
                         self.state = State::TcpHandshakeDummy;
                         log::info!("state changed from client_idle to client_tcp_handshake_dummy");
@@ -1087,6 +1148,7 @@ impl Client {
                     }
                 }
             }
+            self.attempt_endpoint_selected = false;
             self.info.last_state_time = now;
             self.info.last_hb_sent_time = 0;
             // fall through
@@ -1224,6 +1286,34 @@ impl Client {
         iptables::pattern_for(&self.cfg, addr)
     }
 
+    fn refresh_lower_level_for_current(&mut self) -> bool {
+        if !matches!(self.cfg.lower_level, Some(LowerLevel::Auto)) || self.lower_level_ready {
+            return true;
+        }
+        let IpAddr::V4(v4) = self.remote.ip() else {
+            log::warn!("lower-level auto cannot prepare non-IPv4 endpoint {}", self.remote);
+            return false;
+        };
+        match net::lower_level::find_lower_level_info(v4) {
+            Ok((dest_ip, if_name, mac)) => match addr::if_nametoindex(&if_name) {
+                Ok(idx) => {
+                    self.info.raw.send_info.addr_ll = net::raw::make_sockaddr_ll(idx, &mac);
+                    self.lower_level_ready = true;
+                    log::info!("lower-level (auto) now {dest_ip} {if_name} {}", fmt_mac(&mac));
+                    true
+                }
+                Err(e) => {
+                    log::warn!("lower-level: {if_name}: {e}; endpoint attempt remains idle");
+                    false
+                }
+            },
+            Err(e) => {
+                log::warn!("lower-level auto re-detect for {v4} failed: {e}; endpoint attempt remains idle");
+                false
+            }
+        }
+    }
+
     /// Kernel state for the address we start with: its `-a` rule came from `Iptables::init`,
     /// its host route (with `--underlay-dev`) is installed here.
     fn record_initial_endpoint(&mut self) {
@@ -1267,7 +1357,7 @@ impl Client {
     /// Rule and route for `addr`, installed before the first packet goes there. Each resource
     /// has independent desired/installed state: an existing rule (or no `-a` at all) cannot
     /// suppress a route retry, and a route success cannot suppress a failed rule retry.
-    fn ensure_installed(&mut self, addr: SocketAddr) {
+    fn ensure_installed(&mut self, addr: SocketAddr) -> bool {
         let pos = match self.installed.iter().position(|i| i.addr == addr) {
             Some(p) => p,
             None => {
@@ -1332,6 +1422,14 @@ impl Client {
             },
         );
         self.installed[pos].route_metric = metric;
+        self.installed[pos].resources.ready()
+    }
+
+    fn endpoint_resources_ready(&self, addr: SocketAddr) -> bool {
+        self.installed
+            .iter()
+            .find(|installed| installed.addr == addr)
+            .is_some_and(|installed| installed.resources.ready())
     }
 
     fn release(&mut self, addr: SocketAddr) {
@@ -1429,20 +1527,7 @@ impl Client {
         self.remote = sw.to;
         self.info.raw.send_info.dst_ip = sw.to.ip();
         self.info.raw.send_info.dst_port = sw.to.port();
-        if matches!(self.cfg.lower_level, Some(LowerLevel::Auto)) {
-            if let IpAddr::V4(v4) = sw.to.ip() {
-                match net::lower_level::find_lower_level_info(v4) {
-                    Ok((dest_ip, if_name, mac)) => match addr::if_nametoindex(&if_name) {
-                        Ok(idx) => {
-                            self.info.raw.send_info.addr_ll = net::raw::make_sockaddr_ll(idx, &mac);
-                            log::info!("lower-level (auto) now {dest_ip} {if_name} {}", fmt_mac(&mac));
-                        }
-                        Err(e) => log::warn!("lower-level: {if_name}: {e}"),
-                    },
-                    Err(e) => log::warn!("lower-level auto re-detect for {v4} failed: {e}; keeping the previous link-layer destination"),
-                }
-            }
-        }
+        self.lower_level_ready = !matches!(self.cfg.lower_level, Some(LowerLevel::Auto));
         log::warn!("endpoint: relay is now {} (was {}; {})", sw.to, sw.from, sw.why);
     }
 
